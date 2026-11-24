@@ -133,6 +133,78 @@ dobj run example::Action --arg 'amount={"Int":"42"}' --arg 'label="hello"'
 
 For example, an API request can contain `"args": {"amount": {"Int": "42"}, "label": "hello"}`. Integers use decimal strings inside `Int`; raw values use 64 hexadecimal digits inside `Untyped`; strings are ordinary JSON strings. Containers use POD2's existing container serialization. The driver deserializes each value and reports errors by argument name. Unknown names are accepted, and scripts may ignore them.
 
+## Action-result claims
+
+An action run can optionally produce a companion proof about one output while
+the SDK still has the action statement and its concrete inputs and outputs.
+The ordinary transaction proof remains unchanged and is the only proof sent to
+the relayer. A claim binds the selected action predicate, transaction, optional
+input commitment, output commitment, and requested output fields in one proof.
+The complete object data and unrequested fields remain private.
+
+For example, to disclose only the resulting object's `score`, request a claim
+for output 0 and input 0:
+
+```json
+{
+  "input": {
+    "action": "example::ScoreObject",
+    "inputObjectPaths": ["source.dobj"]
+  },
+  "claim": {
+    "outputIndex": 0,
+    "inputIndex": 0,
+    "discloseFields": ["score"]
+  }
+}
+```
+
+Send this as the body of `POST /runs`. Once the run succeeds, use its
+`txFinal` with `GET /transactions/{txFinal}/claim` to retrieve the companion
+proof and its public disclosures. `outputIndex` and `inputIndex` address the
+flattened outputs and inputs of the action; omit `inputIndex` when the claim
+should not expose an input commitment.
+
+Claims currently support script actions with no nested object IO. Requests for
+built-in rekey actions or actions whose sub-actions declare inputs or outputs
+are rejected before execution/proving. Ordinary execution of these actions is
+unchanged. This restriction avoids assigning flattened child indexes to a
+parent predicate's local IO slots. Duplicate requested field names are deduplicated.
+
+Use `SdkModule::verify_action_result_claim` to verify the exported wire envelope.
+Pass the expected qualified action, request, and a trusted action predicate hash.
+Resolve the plugin/name to the loaded module from a trusted catalog; names are
+not globally authenticated identities. Indexes are checked against the expected
+request and the loaded action's IO schema. The reconstructed claim predicate
+binds the selected IO slots, and all commitment and field metadata is compared
+with the authenticated public statement. The verifier requires default proof
+parameters, the standard verifier set, and the real Plonky2 MainPod backend.
+Mock proofs are rejected. Mock serialization contains private witnesses and
+provides no zero-knowledge privacy. Generic `pod.verify()` is insufficient.
+
+The companion proves a grounded replay, with the action's chain endpoints,
+from the canonical initial transaction context to the claimed final commitment.
+The final dictionary's normalized zero scope fields are not chain endpoints.
+This establishes existence of a valid execution for that transaction commitment;
+the network commitment does not identify a unique historical witness or replay.
+Network inclusion and finality require a separate trusted synchronizer/chain
+check of the returned transaction commitment.
+
+The companion predicate hash has changed. Older companion claims do not pass
+this verifier and need a new proof from their execution witnesses. Network
+predicates, plugin predicate emission/hashes, transaction proofs, and blob
+payload encoding are unchanged; no network or stored-object migration is needed.
+
+Claim requests use `discloseFields`; exported claims use `outputCommitment`.
+These replace the earlier `fields` and `resultCommitment` JSON names.
+
+Expensive real proof, JSON round-trip, privacy, shrinking, and real blob parser
+coverage is explicitly ignored by default. Run it with:
+
+```sh
+cargo test -p sdk --release --locked --offline action_result_claim_real_proof -- --ignored
+```
+
 ## Native statements
 
 Each `action.st_*` method emits one pod2 native statement. Arguments follow

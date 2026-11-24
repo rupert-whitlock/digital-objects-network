@@ -13,7 +13,8 @@ use txlib::{grounding_aged_out, object_nullifier_hash};
 use wire_types::relayer::{JobStatus, JobStatusResponse};
 use wire_types::transactions::{PendingName, TransactionRecord, TransactionState};
 use wire_types::{
-    ExecutionPhase, ExecutionStage, MutatedObjectSlots, ObjectSummary, QualifiedName,
+    ActionResultClaim, ActionResultClaimRequest, ExecutionPhase, ExecutionStage,
+    MutatedObjectSlots, ObjectSummary, QualifiedName,
 };
 
 use crate::clients::{HASH_BATCH_LIMIT, SynchronizerMembership, SynchronizerTxStatus};
@@ -30,8 +31,8 @@ use crate::object_store::{
     write_object_file,
 };
 use crate::transactions::{
-    load_records, locked_inputs, read_record, record_tx_final, remove_transaction, write_payload,
-    write_record,
+    load_records, locked_inputs, read_claim, read_record, record_tx_final, remove_transaction,
+    write_claim, write_payload, write_record,
 };
 use crate::types::{ExecuteActionInput, ExecutionReporter, ExecutionStepContext, ObjectQuery};
 
@@ -65,6 +66,7 @@ pub struct ProvedTransaction {
     pub payload_bytes: Vec<u8>,
     /// Which input each mutated output replaces.
     pub mutated_objects: Vec<MutatedObjectSlots>,
+    pub claim: Option<ActionResultClaim>,
     holds: Holds,
 }
 
@@ -132,6 +134,18 @@ impl Driver {
         owner: &str,
         reporter: &R,
     ) -> Result<ProvedTransaction> {
+        self.prove_with_claim(input, None, owner, reporter)
+    }
+
+    /// Prove an action and optionally retain a separate selective-disclosure
+    /// MainPod. The transaction proof and payload are unchanged.
+    pub fn prove_with_claim<R: ExecutionReporter>(
+        &self,
+        input: ExecuteActionInput,
+        claim_request: Option<ActionResultClaimRequest>,
+        owner: &str,
+        reporter: &R,
+    ) -> Result<ProvedTransaction> {
         let settings = self.load_settings()?;
         // Use one catalog version for both action lookup and execution.
         let catalog = self.catalog();
@@ -196,12 +210,20 @@ impl Driver {
                 },
             );
         });
-        let spendable_outputs = run_at_cpu_usage(settings.cpu_usage, || {
-            catalog.execute_action_with_progress(
+        let sdk_claim = claim_request
+            .as_ref()
+            .map(|claim| sdk::ActionResultClaimRequest {
+                output_index: claim.output_index,
+                input_index: claim.input_index,
+                disclose_fields: claim.disclose_fields.clone(),
+            });
+        let mut spendable_outputs = run_at_cpu_usage(settings.cpu_usage, || {
+            catalog.execute_action_with_claim(
                 input.action.clone(),
                 grounding_witness,
                 execution_inputs,
                 &args,
+                sdk_claim.as_ref(),
                 progress,
             )
         })?;
@@ -237,8 +259,35 @@ impl Driver {
                 obj: spendable.obj.clone(),
             })
             .collect();
+        let tx_final = spendable_outputs.tx.dict().commitment();
+        let claim = spendable_outputs
+            .claim
+            .take()
+            .map(|claim| -> Result<ActionResultClaim> {
+                Ok(ActionResultClaim {
+                    action: QualifiedName::new(input.action.plugin_name.clone(), claim.action),
+                    action_predicate_hash: encode_hash_hex(&claim.action_predicate_hash),
+                    tx_final: encode_hash_hex(&tx_final),
+                    output_index: claim.output_index,
+                    input_index: claim.input_index,
+                    input_commitment: claim.input_commitment.as_ref().map(encode_hash_hex),
+                    output_commitment: encode_hash_hex(&claim.output_commitment),
+                    disclosed_fields: claim
+                        .disclosed_fields
+                        .into_iter()
+                        .map(|(key, value)| {
+                            serde_json::to_value(value)
+                                .map(|value| (key, value))
+                                .context("failed to serialize disclosed claim value")
+                        })
+                        .collect::<Result<_>>()?,
+                    proof: serde_json::to_value(claim.pod)
+                        .context("failed to serialize companion MainPod")?,
+                })
+            })
+            .transpose()?;
         Ok(ProvedTransaction {
-            tx_final: spendable_outputs.tx.dict().commitment(),
+            tx_final,
             action: input.action,
             owner: owner.to_string(),
             grounding_root,
@@ -248,6 +297,7 @@ impl Driver {
             created: spendable_outputs.tx.created_commitments()?,
             payload_bytes,
             mutated_objects: action.mutated_objects.clone(),
+            claim,
             holds,
         })
     }
@@ -350,6 +400,9 @@ impl Driver {
                 write_object_file(&self.paths, &output_record, file_name)?;
             }
             write_payload(&self.paths, &proved.tx_final, &proved.payload_bytes)?;
+            if let Some(claim) = &proved.claim {
+                write_claim(&self.paths, &proved.tx_final, claim)?;
+            }
             write_record(&self.paths, &record)
         })();
         if let Err(mut err) = result {
@@ -367,6 +420,15 @@ impl Driver {
             return Err(err);
         }
         Ok(record)
+    }
+
+    /// Return the companion claim recorded for this transaction, if one was
+    /// requested at execution time.
+    pub fn get_transaction_claim(&self, tx_final: &Hash) -> Result<Option<ActionResultClaim>> {
+        if read_record(&self.paths, tx_final)?.is_none() {
+            return Err(DriverError::TransactionNotFound(encode_hash_hex(tx_final)).into());
+        }
+        read_claim(&self.paths, tx_final)
     }
 
     /// Delete a `recorded` transaction and its unknown outputs. Refuse once

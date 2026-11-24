@@ -2646,6 +2646,374 @@ fn test_generated_class_rekey() {
 }
 
 #[test]
+fn test_action_result_claim_does_not_disclose_unrequested_fields() {
+    let module = Sdk::default()
+        .load_module_from_src_actions(
+            r#"
+                fn CreateRecord(action) {
+                    var item = action.output("Record");
+                    var private_value = unsafe { arg("private_value") ?? "" };
+                    item.set([
+                        ["public_value", 7],
+                        ["private_value", private_value]
+                    ]);
+                }
+            "#,
+            &["CreateRecord"],
+        )
+        .unwrap();
+    let state = TestState::default();
+    let executor = module.executor(true, grounding_witness(&state, &[]));
+    let request = ActionResultClaimRequest {
+        output_index: 0,
+        input_index: None,
+        disclose_fields: vec!["public_value".to_string()],
+    };
+
+    let args = ActionArgs::from([(
+        "private_value".to_string(),
+        Value::from("PRIVATE_SENTINEL_8f83c7"),
+    )]);
+    let result = executor
+        .action_with_args_and_claim("CreateRecord", vec![], &args, Some(&request))
+        .unwrap();
+    let claim = result.claim.expect("claim requested");
+    claim.pod.pod.verify().unwrap();
+
+    let [public_statement] = claim.pod.public_statements.as_slice() else {
+        panic!(
+            "expected one public claim statement, got {:?}",
+            claim.pod.public_statements
+        );
+    };
+    let public_args = public_statement.args();
+    let [
+        StatementArg::Literal(claim_metadata),
+        StatementArg::Literal(disclosures),
+    ] = public_args.as_slice()
+    else {
+        panic!("claim arguments are not public literal values: {public_statement:?}");
+    };
+    let claim_metadata = claim_metadata
+        .as_dictionary()
+        .expect("claim metadata is a dictionary");
+    assert_eq!(claim_metadata.iter().count(), 3);
+
+    let disclosures = disclosures
+        .as_dictionary()
+        .expect("disclosures are a dictionary");
+    assert_eq!(disclosures.iter().count(), 1);
+    assert_eq!(
+        disclosures
+            .get(&StrKey::from("public_value"))
+            .unwrap()
+            .unwrap(),
+        Value::from(7)
+    );
+    assert!(
+        disclosures
+            .get(&StrKey::from("private_value"))
+            .unwrap()
+            .is_none(),
+        "unrequested field was disclosed: {disclosures:?}"
+    );
+}
+
+fn claim_statement(claim: &ActionResultClaim) -> Statement {
+    let [statement] = claim.pod.public_statements.as_slice() else {
+        panic!("expected one public claim statement");
+    };
+    statement.clone()
+}
+
+fn replace_claim_argument(
+    statement: Statement,
+    arg_index: usize,
+    dictionary_key: &str,
+    value: Value,
+) -> Statement {
+    let Statement::Custom(predicate, mut args) = statement else {
+        panic!("claim statement is not a custom predicate");
+    };
+    let pod2::middleware::ValueRef::Literal(claim_metadata) = &args[0] else {
+        panic!("claim metadata is not public");
+    };
+    let pod2::middleware::ValueRef::Literal(disclosures) = &args[1] else {
+        panic!("disclosures are not public");
+    };
+    let mut entries = if arg_index == 0 {
+        claim_metadata
+            .as_dictionary()
+            .expect("claim metadata dictionary")
+            .iter()
+            .map(|entry| {
+                let (key, value) = entry.expect("claim metadata entry");
+                (StrKey::from(key), value)
+            })
+            .collect::<HashMap<_, _>>()
+    } else {
+        disclosures
+            .as_dictionary()
+            .expect("disclosures dictionary")
+            .iter()
+            .map(|entry| {
+                let (key, value) = entry.expect("disclosure entry");
+                (StrKey::from(key), value)
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    entries.insert(StrKey::from(dictionary_key), value);
+    args[arg_index] = pod2::middleware::ValueRef::Literal(Value::from(Dictionary::new(entries)));
+    Statement::Custom(predicate, args)
+}
+
+fn assert_claim_substitution_is_rejected(claim: &ActionResultClaim, statement: Statement) {
+    let mut builder =
+        pod2::frontend::MainPodBuilder::new(&claim.pod.params, claim.pod.pod.vd_set());
+    builder.add_pod(claim.pod.clone()).unwrap();
+    assert!(builder.open_input_st(true, 0, &statement).is_err());
+}
+
+#[test]
+fn test_action_result_claim_binds_action_transaction_input_result_and_fields() {
+    let module = Sdk::default()
+        .load_module_from_src_actions(
+            r#"
+                fn CreateObjects(action) {
+                    var source = action.output("Source");
+                    source.set([["value", 8]]);
+                    var decoy = action.output("Decoy");
+                    decoy.set([["value", 99]]);
+                }
+
+                fn Transform(action) {
+                    var source = action.input("Source");
+                    var decoy = action.input("Decoy");
+                    var result = action.output("Result");
+                    var other = action.output("Other");
+                    result.set([["value", source.value]]);
+                    other.set([["value", decoy.value]]);
+                }
+
+                fn Unrelated(action) {
+                    var item = action.output("Unrelated");
+                    item.set([["value", 100]]);
+                }
+
+                fn Revise(action) {
+                    var item = action.mutate("Result");
+                    item.update("value", 10);
+                }
+            "#,
+            &["CreateObjects", "Transform", "Unrelated", "Revise"],
+        )
+        .unwrap();
+    let mut state = TestState::default();
+    let seed = module
+        .executor(true, grounding_witness(&state, &[]))
+        .action("CreateObjects", vec![])
+        .unwrap();
+    apply_tx(&mut state, &seed.tx);
+    let [source, decoy] = seed.objs();
+
+    let request = ActionResultClaimRequest {
+        output_index: 0,
+        input_index: Some(0),
+        disclose_fields: vec!["value".to_string()],
+    };
+    let transformed = module
+        .executor(
+            true,
+            grounding_witness(&state, &[source.obj.commitment(), decoy.obj.commitment()]),
+        )
+        .action_with_args_and_claim(
+            "Transform",
+            vec![source.clone(), decoy.clone()],
+            &ActionArgs::new(),
+            Some(&request),
+        )
+        .unwrap();
+    let claim = transformed.claim.as_ref().expect("claim requested");
+    claim.pod.pod.verify().unwrap();
+    assert_eq!(transformed.tx_pod.public_statements.len(), 1);
+
+    let [result, other] = transformed.objs();
+    let expected_action_hash = module.action_hash("Transform").unwrap();
+    let expected_input = source.obj.commitment();
+    let expected_result = result.obj.commitment();
+    let expected_tx_final = transformed.tx.dict().commitment();
+    assert_eq!(claim.action, "Transform");
+    assert_eq!(claim.action_predicate_hash, expected_action_hash);
+    assert_eq!(claim.input_commitment, Some(expected_input));
+    assert_eq!(claim.output_commitment, expected_result);
+    assert_eq!(claim.disclosed_fields.get("value"), Some(&Value::from(8)));
+    assert!(
+        transformed
+            .tx
+            .created
+            .contains(&Value::from(result.obj.clone()))
+            .unwrap()
+    );
+    assert!(
+        !transformed
+            .tx
+            .created
+            .contains(&Value::from(source.obj.clone()))
+            .unwrap()
+    );
+
+    let original_statement = claim_statement(claim);
+    let public_args = original_statement.args();
+    let [
+        StatementArg::Literal(public_claim),
+        StatementArg::Literal(public_disclosures),
+    ] = public_args.as_slice()
+    else {
+        panic!("claim arguments are not public dictionaries");
+    };
+    let public_claim = public_claim.as_dictionary().unwrap();
+    assert_eq!(public_claim.iter().count(), 4);
+    assert_eq!(
+        public_claim
+            .get(&StrKey::from("action_predicate_hash"))
+            .unwrap(),
+        Some(Value::from(expected_action_hash))
+    );
+    assert_eq!(
+        public_claim
+            .get(&StrKey::from("tx_final_commitment"))
+            .unwrap(),
+        Some(Value::from(expected_tx_final))
+    );
+    assert_eq!(
+        public_claim.get(&StrKey::from("input_commitment")).unwrap(),
+        Some(Value::from(expected_input))
+    );
+    assert_eq!(
+        public_claim
+            .get(&StrKey::from("output_commitment"))
+            .unwrap(),
+        Some(Value::from(expected_result))
+    );
+    let public_disclosures = public_disclosures.as_dictionary().unwrap();
+    assert_eq!(public_disclosures.iter().count(), 1);
+    assert_eq!(
+        public_disclosures.get(&StrKey::from("value")).unwrap(),
+        Some(Value::from(8))
+    );
+
+    for (key, value) in [
+        (
+            "action_predicate_hash",
+            Value::from(module.action_hash("Unrelated").unwrap()),
+        ),
+        (
+            "tx_final_commitment",
+            Value::from(seed.tx.dict().commitment()),
+        ),
+        ("input_commitment", Value::from(decoy.obj.commitment())),
+        ("output_commitment", Value::from(other.obj.commitment())),
+    ] {
+        let substituted = replace_claim_argument(original_statement.clone(), 0, key, value);
+        assert_claim_substitution_is_rejected(claim, substituted);
+    }
+
+    let substituted_non_created_result = replace_claim_argument(
+        original_statement.clone(),
+        0,
+        "output_commitment",
+        Value::from(source.obj.commitment()),
+    );
+    assert_claim_substitution_is_rejected(claim, substituted_non_created_result);
+
+    let substituted_field =
+        replace_claim_argument(original_statement.clone(), 1, "value", Value::from(99));
+    assert_claim_substitution_is_rejected(claim, substituted_field);
+
+    let second_request = ActionResultClaimRequest {
+        output_index: 1,
+        input_index: Some(1),
+        disclose_fields: vec!["value".into(), "value".into()],
+    };
+    let second = module
+        .executor(
+            true,
+            grounding_witness(&state, &[source.obj.commitment(), decoy.obj.commitment()]),
+        )
+        .action_with_args_and_claim(
+            "Transform",
+            vec![source.clone(), decoy.clone()],
+            &ActionArgs::new(),
+            Some(&second_request),
+        )
+        .unwrap();
+    let second_claim = second.claim.as_ref().unwrap();
+    assert_eq!(second_claim.input_commitment, Some(decoy.obj.commitment()));
+    assert_eq!(
+        second_claim.output_commitment,
+        second.objs[1].obj.commitment()
+    );
+    assert_eq!(
+        second_claim.disclosed_fields.get("value"),
+        Some(&Value::from(99))
+    );
+    let second_envelope = claim_envelope(second_claim, &second.tx);
+    module
+        .verify_claim(
+            &second_envelope,
+            &second_envelope.action,
+            &second_request,
+            expected_action_hash,
+            &second_claim.pod,
+            true,
+        )
+        .unwrap();
+    let mut wrong_slot = second_envelope.clone();
+    wrong_slot.output_index = 0;
+    let wrong_request = ActionResultClaimRequest {
+        output_index: 0,
+        ..second_request.clone()
+    };
+    assert!(
+        module
+            .verify_claim(
+                &wrong_slot,
+                &second_envelope.action,
+                &wrong_request,
+                expected_action_hash,
+                &second_claim.pod,
+                true
+            )
+            .is_err()
+    );
+
+    apply_tx(&mut state, &transformed.tx);
+    let revised = module
+        .executor(true, grounding_witness(&state, &[result.obj.commitment()]))
+        .action("Revise", vec![result.clone()])
+        .unwrap();
+    let later_result = revised.obj(0);
+    assert_ne!(later_result.obj.commitment(), expected_result);
+    assert_eq!(
+        later_result
+            .obj
+            .get(&StrKey::from("stable_identifier"))
+            .unwrap(),
+        result.obj.get(&StrKey::from("stable_identifier")).unwrap()
+    );
+    let substituted_later_state = replace_claim_argument(
+        original_statement.clone(),
+        0,
+        "output_commitment",
+        Value::from(later_result.obj.commitment()),
+    );
+    let substituted_later_field =
+        replace_claim_argument(original_statement, 1, "value", Value::from(10));
+    assert_claim_substitution_is_rejected(claim, substituted_later_state);
+    assert_claim_substitution_is_rejected(claim, substituted_later_field);
+}
+
+#[test]
 fn test_builtin_rekey_discovery_execution_and_planning() {
     let src = r#"
         fn SpawnFoo(action) {
@@ -2913,4 +3281,462 @@ fn test_commitment_requires_an_object() {
         };
         assert!(err.contains(expected), "{err}");
     }
+}
+
+fn claim_envelope(claim: &ActionResultClaim, tx: &Tx) -> wire_types::ActionResultClaim {
+    wire_types::ActionResultClaim {
+        action: wire_types::QualifiedName::new("test", &claim.action),
+        action_predicate_hash: format!("{:#}", claim.action_predicate_hash),
+        tx_final: format!("{:#}", tx.dict().commitment()),
+        output_index: claim.output_index,
+        input_index: claim.input_index,
+        input_commitment: claim.input_commitment.map(|hash| format!("{hash:#}")),
+        output_commitment: format!("{:#}", claim.output_commitment),
+        disclosed_fields: claim
+            .disclosed_fields
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::to_value(value).unwrap()))
+            .collect(),
+        proof: serde_json::to_value(&claim.pod).unwrap(),
+    }
+}
+
+#[test]
+fn test_action_result_claim_rejects_mixed_execution_evidence() {
+    let module = Sdk::default()
+        .load_module_from_src_actions(
+            r#"
+        fn Seed(action) {
+            var first = action.output("Source");
+            var second = action.output("Source");
+        }
+        fn A(action) {
+            var source = action.input("Source");
+            var result = action.output("Result");
+            result.set([["value", 7]]);
+            var key = unsafe { 42 };
+            result.update("key", key);
+        }
+        fn B(action) {
+            var source = action.input("Source");
+            var result = action.output("Result");
+            result.set([["value", 7]]);
+            var key = unsafe { 42 };
+            result.update("key", key);
+        }
+    "#,
+            &["Seed", "A", "B"],
+        )
+        .unwrap();
+    let mut state = TestState::default();
+    let seed = module
+        .executor(true, grounding_witness(&state, &[]))
+        .action("Seed", vec![])
+        .unwrap();
+    apply_tx(&mut state, &seed.tx);
+    let [first, second] = seed.objs();
+    let executor = module.executor(
+        true,
+        grounding_witness(&state, &[first.obj.commitment(), second.obj.commitment()]),
+    );
+    let mut a = executor
+        .build_action("A", vec![first.clone()], &ActionArgs::new())
+        .unwrap();
+    let mut b = executor
+        .build_action("B", vec![second.clone()], &ActionArgs::new())
+        .unwrap();
+    assert_ne!(first.obj.commitment(), second.obj.commitment());
+    assert_eq!(a.outputs[0].commitment(), b.outputs[0].commitment());
+    assert_ne!(a.tx.dict().commitment(), b.tx.dict().commitment());
+    b.bld
+        .builder
+        .reveal(&b.finalization_evidence.replay)
+        .unwrap();
+    b.bld
+        .builder
+        .reveal(&b.finalization_evidence.inputs_grounded)
+        .unwrap();
+    let b_proof = prove(b.bld.builder, &MockProver {}, None).unwrap();
+    b_proof.pod.verify().unwrap();
+    a.bld.builder.add_pod(b_proof).unwrap();
+    let request = ActionResultClaimRequest {
+        output_index: 0,
+        input_index: Some(0),
+        disclose_fields: vec!["value".into()],
+    };
+    let inputs = [first.obj];
+    let resolved =
+        Executor::resolve_action_result_claim(&inputs, &a.outputs, &a.action_evidence, &request)
+            .unwrap();
+    // Construct fresh evidence from A plus B's independently valid finalization
+    // and replay. No public statement of an existing claim is edited.
+    let other_inputs = [second.obj];
+    let other_context = ActionResultClaimContext {
+        tx: &b.tx,
+        inputs: &other_inputs,
+        outputs: &b.outputs,
+        action_evidence: &b.action_evidence,
+        st_tx_finalized: &b.st_tx_finalized,
+        finalization_evidence: &b.finalization_evidence,
+    };
+    let attack = executor.add_action_result_disclosures(
+        &mut a.bld,
+        &other_context,
+        &resolved,
+        &request.disclose_fields,
+    );
+    assert!(
+        attack.is_err(),
+        "mixed action and replay evidence was accepted"
+    );
+    let mut forged = a.action_evidence[0].clone();
+    let replay_args = b.finalization_evidence.replay.args();
+    let StatementArg::Literal(start) = &replay_args[3] else {
+        panic!("chain start must be literal")
+    };
+    let StatementArg::Literal(end) = &replay_args[4] else {
+        panic!("chain end must be literal")
+    };
+    forged.chain0 = Hash::from(start.raw());
+    forged.chain = Hash::from(end.raw());
+    let forged_evidence = [forged];
+    let forged_resolved =
+        Executor::resolve_action_result_claim(&inputs, &a.outputs, &forged_evidence, &request)
+            .unwrap();
+    let forged_attack = executor.add_action_result_disclosures(
+        &mut a.bld,
+        &other_context,
+        &forged_resolved,
+        &request.disclose_fields,
+    );
+    assert!(
+        forged_attack.is_err(),
+        "lying about action chain witnesses was accepted"
+    );
+}
+
+#[test]
+fn test_action_result_claim_verifier_rejects_untrusted_envelopes() {
+    let module = Sdk::default()
+        .load_module_from_src_actions(
+            r#"
+        fn Create(action) {
+            var result = action.output("Result");
+            result.set([["value", 7]]);
+        }
+    "#,
+            &["Create"],
+        )
+        .unwrap();
+    let state = TestState::default();
+    let executor = module.executor(true, grounding_witness(&state, &[]));
+    let request = ActionResultClaimRequest {
+        output_index: 0,
+        input_index: None,
+        disclose_fields: vec!["value".into()],
+    };
+    let result = executor
+        .action_with_args_and_claim("Create", vec![], &ActionArgs::new(), Some(&request))
+        .unwrap();
+    let envelope = claim_envelope(result.claim.as_ref().unwrap(), &result.tx);
+    let action = envelope.action.clone();
+    let trusted = module.action_hash("Create").unwrap();
+    let claim_pod = &result.claim.as_ref().unwrap().pod;
+    let verify = |envelope: &wire_types::ActionResultClaim| {
+        module.verify_claim(envelope, &action, &request, trusted, claim_pod, true)
+    };
+    assert_eq!(verify(&envelope).unwrap(), result.tx.dict().commitment());
+    assert!(
+        module
+            .verify_action_result_claim(&envelope, &action, &request, trusted)
+            .is_err(),
+        "production verifier accepted a mock proof"
+    );
+    assert!(
+        module
+            .verify_claim(
+                &envelope,
+                &action,
+                &request,
+                Hash::default(),
+                claim_pod,
+                true
+            )
+            .is_err()
+    );
+    let mut tampered = envelope.clone();
+    tampered.action.name = "Other".into();
+    assert!(verify(&tampered).is_err());
+    tampered = envelope.clone();
+    tampered.output_index = 1;
+    assert!(verify(&tampered).is_err());
+    tampered = envelope.clone();
+    tampered.input_index = Some(0);
+    assert!(verify(&tampered).is_err());
+    tampered = envelope.clone();
+    tampered.tx_final = format!("{:#}", Hash::default());
+    assert!(verify(&tampered).is_err());
+    tampered = envelope.clone();
+    tampered.output_commitment = format!("{:#}", Hash::default());
+    assert!(verify(&tampered).is_err());
+    tampered = envelope.clone();
+    tampered.disclosed_fields.insert(
+        "value".into(),
+        serde_json::to_value(Value::from(99)).unwrap(),
+    );
+    assert!(verify(&tampered).is_err());
+    tampered = envelope.clone();
+    tampered.proof = serde_json::to_value(&result.tx_pod).unwrap();
+    assert!(
+        module
+            .verify_claim(&tampered, &action, &request, trusted, &result.tx_pod, true)
+            .is_err(),
+        "valid unrelated predicate accepted"
+    );
+    let mut proof = result.claim.as_ref().unwrap().pod.clone();
+    proof.params.max_statements += 1;
+    assert!(
+        module
+            .verify_claim(&envelope, &action, &request, trusted, &proof, true)
+            .is_err()
+    );
+}
+
+#[test]
+fn test_action_result_claim_rekey_nested_and_invalid_requests() {
+    let module = Sdk::default()
+        .load_module_from_src_actions(
+            r#"
+        fn Child(action) { var result = action.output("Result"); }
+        fn Parent(action) { var own = action.output("Own"); action.subaction("Child"); }
+    "#,
+            &["Child", "Parent"],
+        )
+        .unwrap();
+    let state = TestState::default();
+    let executor = module.executor(true, grounding_witness(&state, &[]));
+    let request = ActionResultClaimRequest {
+        output_index: 0,
+        input_index: None,
+        disclose_fields: vec![],
+    };
+    assert!(
+        executor
+            .action_with_args_and_claim("RekeyResult", vec![], &ActionArgs::new(), Some(&request))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("built-in rekey")
+    );
+    assert!(
+        executor
+            .action_with_args_and_claim("Parent", vec![], &ActionArgs::new(), Some(&request))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("nested object IO")
+    );
+    assert_eq!(executor.action("Parent", vec![]).unwrap().objs.len(), 2);
+    let child = executor.action("Child", vec![]).unwrap();
+    let mut grounded = state;
+    apply_tx(&mut grounded, &child.tx);
+    let object = child.obj(0);
+    let stages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded_stages = stages.clone();
+    let rekey_executor = module
+        .executor(
+            true,
+            grounding_witness(&grounded, &[object.obj.commitment()]),
+        )
+        .with_progress(Arc::new(move |stage| {
+            recorded_stages.lock().unwrap().push(stage)
+        }));
+    assert!(
+        rekey_executor
+            .action_with_args_and_claim(
+                "RekeyResult",
+                vec![object.clone()],
+                &ActionArgs::new(),
+                Some(&request)
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("built-in rekey")
+    );
+    assert!(
+        stages.lock().unwrap().is_empty(),
+        "unsupported claim performed execution work"
+    );
+    assert_eq!(
+        rekey_executor
+            .action("RekeyResult", vec![object])
+            .unwrap()
+            .objs
+            .len(),
+        1
+    );
+
+    for invalid in [
+        ActionResultClaimRequest {
+            output_index: 1,
+            ..request.clone()
+        },
+        ActionResultClaimRequest {
+            input_index: Some(0),
+            ..request.clone()
+        },
+        ActionResultClaimRequest {
+            disclose_fields: vec!["missing".into()],
+            ..request.clone()
+        },
+    ] {
+        assert!(
+            executor
+                .action_with_args_and_claim("Child", vec![], &ActionArgs::new(), Some(&invalid))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+#[ignore = "expensive: real Plonky2 claim, JSON round trip, privacy and blob verification"]
+fn test_action_result_claim_real_proof_roundtrip_and_payload() {
+    use payload::{
+        payload::{Payload, PayloadProof},
+        proof::{BlobParser, ProofParser},
+        shrink::{ShrunkMainPodSetup, shrink_compress_pod},
+    };
+    let module = Sdk::default()
+        .load_module_from_src_actions(
+            r#"
+        fn Create(action) {
+            var result = action.output("Result");
+            var secret = unsafe { arg("secret") ?? "" };
+            result.set([["score", 7], ["secret", secret]]);
+        }
+    "#,
+            &["Create"],
+        )
+        .unwrap();
+    let state = TestState::default();
+    let witness = grounding_witness(&state, &[]);
+    let state_root = witness.state_header.hash();
+    let executor = module.executor(false, witness);
+    let request = ActionResultClaimRequest {
+        output_index: 0,
+        input_index: None,
+        disclose_fields: vec!["score".into()],
+    };
+    let sentinel = "UNREQUESTED_PRIVATE_VALUE_9138c4";
+    let result = executor
+        .action_with_args_and_claim(
+            "Create",
+            vec![],
+            &ActionArgs::from([("secret".into(), Value::from(sentinel))]),
+            Some(&request),
+        )
+        .unwrap();
+    let claim = result.claim.as_ref().unwrap();
+    let encoded = serde_json::to_string(&claim.pod).unwrap();
+    assert!(!encoded.contains(sentinel));
+    let decoded: MainPod = serde_json::from_str(&encoded).unwrap();
+    decoded.pod.verify().unwrap();
+    let mut envelope = claim_envelope(claim, &result.tx);
+    envelope.proof = serde_json::to_value(decoded).unwrap();
+    let action = envelope.action.clone();
+    let trusted = module.action_hash("Create").unwrap();
+    assert_eq!(
+        module
+            .verify_action_result_claim(&envelope, &action, &request, trusted)
+            .unwrap(),
+        result.tx.dict().commitment()
+    );
+    let mut unrelated = envelope.clone();
+    unrelated.proof = serde_json::to_value(&result.tx_pod).unwrap();
+    assert!(
+        module
+            .verify_action_result_claim(&unrelated, &action, &request, trusted)
+            .is_err()
+    );
+    let args = claim_statement(claim).args();
+    let [
+        StatementArg::Literal(metadata),
+        StatementArg::Literal(disclosures),
+    ] = args.as_slice()
+    else {
+        panic!("expected literal claim arguments")
+    };
+    let weak_module = Arc::new(
+        load_module(
+            "ActionResultClaim(claim, disclosures) = AND(Equal(claim, claim))",
+            "weakened_claim",
+            &Params::default(),
+            &[],
+        )
+        .unwrap(),
+    );
+    let mut expanded_set = serde_json::to_value(&*DEFAULT_VD_SET).unwrap();
+    expanded_set["vds_hashes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::to_value(Hash::default()).unwrap());
+    let expanded_set: VDSet = serde_json::from_value(expanded_set).unwrap();
+    for verifier_set in [DEFAULT_VD_SET.clone(), expanded_set] {
+        let mut weak_builder = BuildContext {
+            builder: MultiPodBuilder::new(&Params::default(), &verifier_set),
+            modules: vec![weak_module.clone()],
+        };
+        let equality = weak_builder
+            .builder
+            .priv_op(Operation::eq(metadata.clone(), metadata.clone()))
+            .unwrap();
+        weak_builder
+            .apply_custom_pred(
+                true,
+                "ActionResultClaim",
+                map!({"claim" => metadata.clone(), "disclosures" => disclosures.clone()}),
+                vec![equality],
+            )
+            .unwrap();
+        let weak = prove(weak_builder.builder, &Prover {}, None).unwrap();
+        weak.pod.verify().unwrap();
+        let mut malicious = envelope.clone();
+        malicious.proof = serde_json::to_value(weak).unwrap();
+        let error = module
+            .verify_action_result_claim(&malicious, &action, &request, trusted)
+            .expect_err("valid weakened proof accepted")
+            .to_string();
+        if verifier_set.root() == DEFAULT_VD_SET.root() {
+            assert!(error.contains("expected claim and metadata"), "{error}");
+        } else {
+            assert!(error.contains("verifier set"), "{error}");
+        }
+    }
+    let build = ShrunkMainPodSetup::new(&Params::default()).build().unwrap();
+    let proof = shrink_compress_pod(&build, result.tx_pod).unwrap();
+    let payload = Payload::from_tx(
+        PayloadProof::Plonky2(Box::new(proof)),
+        &result.tx,
+        state_root,
+    )
+    .unwrap();
+    let accepted = ProofParser::new()
+        .unwrap()
+        .parse_blob(&payload.to_bytes())
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.tx_final, result.tx.dict().commitment());
+    let mut wrong = envelope.clone();
+    wrong.tx_final = format!("{:#}", Hash::default());
+    assert!(
+        module
+            .verify_action_result_claim(&wrong, &action, &request, trusted)
+            .is_err()
+    );
+    assert!(
+        module
+            .verify_action_result_claim(&envelope, &action, &request, Hash::default())
+            .is_err()
+    );
 }

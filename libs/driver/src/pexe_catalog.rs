@@ -369,6 +369,36 @@ impl ActionCatalog for PexeCatalog {
         Ok(executor.action_with_args(&action.name, inputs, args)?)
     }
 
+    fn execute_action_with_claim(
+        &self,
+        action: QualifiedName,
+        grounding_witness: GroundingWitness,
+        inputs: Vec<SpendableObject>,
+        args: &ActionArgs,
+        claim: Option<&sdk::ActionResultClaimRequest>,
+        progress: sdk::ExecutionProgress,
+    ) -> Result<SpendableObjects> {
+        progress(sdk::ExecutionStage::LoadingModule);
+        let plugin_idx = *self
+            .action_plugin_idx
+            .get(&action)
+            .ok_or_else(|| anyhow!("no plugin provides action {action}"))?;
+        let plugin = &self.plugins[plugin_idx];
+        let sdk = Sdk::default();
+        let module = sdk
+            .load_module_from_src_manifest(&plugin.script, &plugin.manifest)
+            .map_err(|err| {
+                anyhow!(
+                    "failed to reload plugin {} for execution: {err}",
+                    plugin.manifest.plugin.name
+                )
+            })?;
+        let executor = module
+            .executor(self.mock_proofs, Arc::new(grounding_witness))
+            .with_progress(progress);
+        Ok(executor.action_with_args_and_claim(&action.name, inputs, args, claim)?)
+    }
+
     fn generated_podlang(&self) -> Option<String> {
         if self.combined_podlang_src.is_empty() {
             None

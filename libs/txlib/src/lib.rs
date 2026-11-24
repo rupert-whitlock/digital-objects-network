@@ -432,6 +432,12 @@ pub fn print_stats(stats: &TxStats) {
     }
 }
 
+/// Private statements retained for optional companion execution proofs.
+pub struct FinalizationEvidence {
+    pub replay: Statement,
+    pub inputs_grounded: Statement,
+}
+
 pub struct TxBuilder {
     pub chain: Hash,
     pub chain_start: Hash,
@@ -899,6 +905,15 @@ impl TxBuilder {
     /// Returns an error if an input is not consumed, an unavailable or
     /// already consumed state is consumed, or a state is created more than once.
     pub fn finalize(self, ctx: &mut BuildContext) -> anyhow::Result<(Statement, Tx, TxStats)> {
+        let (statement, tx, stats, _) = self.finalize_with_replay(ctx)?;
+        Ok((statement, tx, stats))
+    }
+
+    /// Retain the private replay and grounding statements for companion proofs.
+    pub fn finalize_with_replay(
+        self,
+        ctx: &mut BuildContext,
+    ) -> anyhow::Result<(Statement, Tx, TxStats, FinalizationEvidence)> {
         assert!(self.action_stack.is_empty(), "unclosed action scopes");
         assert!(
             !self.events.is_empty(),
@@ -1042,7 +1057,7 @@ impl TxBuilder {
                     st_hash_rebound,
                     st_dict_insert,
                     st_bindings,
-                    st_replay,
+                    st_replay.clone(),
                 ],
             )
             .unwrap();
@@ -1054,7 +1069,15 @@ impl TxBuilder {
             ctx: tx_final,
             state_header: self.state_header,
         };
-        Ok((st, tx, stats))
+        Ok((
+            st,
+            tx,
+            stats,
+            FinalizationEvidence {
+                replay: st_replay,
+                inputs_grounded: self.st_inputs_grounded,
+            },
+        ))
     }
 
     // ========================================================================

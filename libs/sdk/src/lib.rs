@@ -10,7 +10,10 @@ use itertools::zip_eq;
 use lt_eq_u256_pod::{LtEqU256Pod, STANDARD_LT_EQ_U256_VD_HASH};
 use pod2::{
     backends::plonky2::{basetypes::DEFAULT_VD_SET, mainpod::Prover, mock::mainpod::MockProver},
-    frontend::{MainPod, MultiPodBuilder, Operation, OperationArg, entry},
+    frontend::{
+        CustomPredicateBatchBuilder, MainPod, MultiPodBuilder, Operation, OperationArg,
+        StatementTmplBuilder, entry, literal,
+    },
     lang::{Module, load_module},
     middleware::{
         F, Hash, MainPodProver, NativePredicate, OperationAux, OperationType, Params, Pod,
@@ -917,12 +920,17 @@ impl ActionHandle {
     /// predicate statement plus its io record, which `subaction` uses
     /// to pin a referenced alias.
     fn exe_action(&self) -> RuntimeResult<(Statement, Array)> {
-        let (module, scope_id, action) = {
+        let (module, scope_id, action, chain0) = {
             let ctx = self.0.borrow();
             let exe_rc = ctx.exe_ctx.as_ref().expect("exe phase").clone();
             let mut exe_ctx = exe_rc.borrow_mut();
             let scope_id = exe_ctx.tx_builder.begin_action();
-            (exe_ctx.module.clone(), scope_id, ctx.name.clone())
+            (
+                exe_ctx.module.clone(),
+                scope_id,
+                ctx.name.clone(),
+                exe_ctx.tx_builder.chain,
+            )
         };
         let mut scope = Scope::new();
         scope.push_constant("state_header", self.state_header());
@@ -1004,6 +1012,18 @@ impl ActionHandle {
                 }
             }
         }
+        let evidence_inputs = in_dicts
+            .iter()
+            .map(|value| value.as_dictionary().expect("action input is a dictionary"))
+            .collect::<Vec<_>>();
+        let evidence_outputs = out_dicts
+            .iter()
+            .map(|value| {
+                value
+                    .as_dictionary()
+                    .expect("action output is a dictionary")
+            })
+            .collect::<Vec<_>>();
         let mut io_dicts = in_dicts;
         io_dicts.extend(out_dicts);
         let io_array = Array::new(io_dicts);
@@ -1587,7 +1607,17 @@ impl ActionHandle {
                 );
                 exe_ctx.tx_builder.set_guard(handle, st_is_x);
             }
+            let chain = exe_ctx.tx_builder.chain;
             exe_ctx.tx_builder.end_action(scope_id);
+            exe_ctx.action_evidence.push(ActionEvidence {
+                action: action.clone(),
+                statement: st_action.clone(),
+                io: io_array.clone(),
+                inputs: evidence_inputs,
+                outputs: evidence_outputs,
+                chain0,
+                chain,
+            });
         }
         Ok((st_action, io_array))
     }
@@ -2969,6 +2999,171 @@ impl SdkModule {
     pub fn class_hash(&self, class_name: &str) -> Option<Hash> {
         self.class_hashes.get(class_name).copied()
     }
+    /// Verify a production claim against a trusted loaded module and action hash.
+    /// The caller resolves the plugin/name to this module out of band. Names and
+    /// flattened indexes are checked against that resolution and the expected
+    /// request; the proof authenticates the corresponding predicate and IO slots.
+    /// This proves a valid transaction execution, not network inclusion/finality.
+    pub fn verify_action_result_claim(
+        &self,
+        envelope: &wire_types::ActionResultClaim,
+        expected_action: &wire_types::QualifiedName,
+        expected_request: &ActionResultClaimRequest,
+        trusted_action_hash: Hash,
+    ) -> Result<Hash, SdkError> {
+        let proof: MainPod =
+            serde_json::from_value(envelope.proof.clone()).map_err(|err| anyhow!(err))?;
+        self.verify_claim(
+            envelope,
+            expected_action,
+            expected_request,
+            trusted_action_hash,
+            &proof,
+            false,
+        )
+    }
+
+    fn verify_claim(
+        &self,
+        envelope: &wire_types::ActionResultClaim,
+        expected_action: &wire_types::QualifiedName,
+        request: &ActionResultClaimRequest,
+        trusted_action_hash: Hash,
+        proof: &MainPod,
+        allow_mock: bool,
+    ) -> Result<Hash, SdkError> {
+        use hex::FromHex;
+        let parse_hash = |value: &str| {
+            Hash::from_hex(value.strip_prefix("0x").unwrap_or(value)).map_err(|err| anyhow!(err))
+        };
+        let meta = self
+            .actions
+            .iter()
+            .find(|meta| meta.name == expected_action.name)
+            .ok_or_else(|| anyhow!("unknown expected action"))?;
+        if meta.kind != ActionKind::Script
+            || meta.total_inputs.len() != meta.in_entries.len()
+            || meta.total_outputs.len() != meta.out_entries.len()
+        {
+            return Err(anyhow!(
+                "claim verification requires a script action without nested object IO"
+            )
+            .into());
+        }
+        if envelope.action != *expected_action
+            || envelope.output_index != request.output_index
+            || envelope.input_index != request.input_index
+        {
+            return Err(anyhow!("claim action or indexes differ from expected request").into());
+        }
+        if request.output_index >= meta.out_entries.len()
+            || request
+                .input_index
+                .is_some_and(|index| index >= meta.in_entries.len())
+        {
+            return Err(anyhow!("claim IO index out of range").into());
+        }
+        if self.action_hash(&expected_action.name) != Some(trusted_action_hash)
+            || parse_hash(&envelope.action_predicate_hash)? != trusted_action_hash
+        {
+            return Err(anyhow!("untrusted action predicate hash").into());
+        }
+        let fields: Vec<_> = request
+            .disclose_fields
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if fields
+            != envelope
+                .disclosed_fields
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        {
+            return Err(anyhow!("disclosed fields differ from expected request").into());
+        }
+        let params = Params::default();
+        let (module, _) = Executor::claim_predicate_module(
+            &params,
+            self,
+            &expected_action.name,
+            request.input_index,
+            meta.in_entries.len() + request.output_index,
+            &fields,
+        )?;
+        let predicate = module.predicate_ref_by_name("ActionResultClaim").unwrap();
+        let tx_final = parse_hash(&envelope.tx_final)?;
+        let mut metadata = HashMap::from([
+            (
+                StrKey::from("action_predicate_hash"),
+                Value::from(trusted_action_hash),
+            ),
+            (StrKey::from("tx_final_commitment"), Value::from(tx_final)),
+            (
+                StrKey::from("output_commitment"),
+                Value::from(parse_hash(&envelope.output_commitment)?),
+            ),
+        ]);
+        match (request.input_index, &envelope.input_commitment) {
+            (Some(_), Some(value)) => {
+                metadata.insert(
+                    StrKey::from("input_commitment"),
+                    Value::from(parse_hash(value)?),
+                );
+            }
+            (None, None) => {}
+            _ => return Err(anyhow!("input commitment differs from request").into()),
+        }
+        let disclosures = Dictionary::new(
+            envelope
+                .disclosed_fields
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        StrKey::from(key.as_str()),
+                        serde_json::from_value::<Value>(value.clone())?,
+                    ))
+                })
+                .collect::<Result<HashMap<_, _>>>()?,
+        );
+        let expected = Statement::Custom(
+            predicate,
+            vec![
+                pod2::middleware::ValueRef::Literal(Value::from(Dictionary::new(metadata))),
+                pod2::middleware::ValueRef::Literal(Value::from(disclosures)),
+            ],
+        );
+        let expected_vds = if allow_mock {
+            VDSet::new(&[])
+        } else {
+            DEFAULT_VD_SET.clone()
+        };
+        if proof.params != params
+            || proof.pod.params() != &params
+            || proof.pod.vd_set().root() != expected_vds.root()
+        {
+            return Err(anyhow!("unexpected proof parameters or verifier set").into());
+        }
+        if !allow_mock
+            && (proof.pod.is_mock()
+                || !(proof.pod.as_ref() as &dyn std::any::Any)
+                    .is::<pod2::backends::plonky2::mainpod::MainPod>())
+        {
+            return Err(anyhow!("claim requires the production Plonky2 MainPod backend").into());
+        }
+        if proof.public_statements != vec![expected.clone()]
+            || proof.pod.pub_statements() != vec![expected]
+        {
+            return Err(
+                anyhow!("proof does not authenticate the expected claim and metadata").into(),
+            );
+        }
+        proof.pod.verify().map_err(|err| anyhow!(err))?;
+        Ok(tx_final)
+    }
+
     pub fn executor(
         self: &Rc<Self>,
         mock: bool,
@@ -3073,6 +3268,32 @@ pub struct SpendableObjects {
     /// created/nullifiers/ctx for the SDK's own bookkeeping. Not part of
     /// the per-output wire format.
     pub tx: Tx,
+    /// Optional selective-disclosure proof requested for this execution.
+    /// It is never included in the transaction payload.
+    pub claim: Option<ActionResultClaim>,
+}
+
+/// Generic request for a companion proof about one action result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionResultClaimRequest {
+    /// Result position in the executed action's flattened output list.
+    pub output_index: usize,
+    /// Optional input position whose commitment should be disclosed.
+    pub input_index: Option<usize>,
+    /// Result dictionary keys whose values should be disclosed.
+    pub disclose_fields: Vec<String>,
+}
+
+/// Companion MainPod plus the public values it proves.
+pub struct ActionResultClaim {
+    pub action: String,
+    pub action_predicate_hash: Hash,
+    pub output_index: usize,
+    pub input_index: Option<usize>,
+    pub input_commitment: Option<Hash>,
+    pub output_commitment: Hash,
+    pub disclosed_fields: BTreeMap<String, Value>,
+    pub pod: MainPod,
 }
 
 impl SpendableObjects {
@@ -3130,7 +3351,48 @@ struct ExeContext {
     // call tree, in declaration order. Sub-actions append into this
     // same vec so the top-level call sees them in order.
     outputs: Vec<Dictionary>,
+    /// Action statements and their concrete IO records. These survive until
+    /// finalization so an optional companion proof can reveal the relationship
+    /// before it is hidden inside `TxFinalized`.
+    action_evidence: Vec<ActionEvidence>,
     progress: Option<ExecutionProgress>,
+}
+
+#[derive(Clone)]
+struct ActionEvidence {
+    action: String,
+    statement: Statement,
+    io: Array,
+    inputs: Vec<Dictionary>,
+    outputs: Vec<Dictionary>,
+    chain0: Hash,
+    chain: Hash,
+}
+
+struct ResolvedActionResultClaim<'a> {
+    evidence: &'a ActionEvidence,
+    input: Option<&'a Dictionary>,
+    result: &'a Dictionary,
+    input_slot: Option<usize>,
+    output_slot: usize,
+}
+
+struct BuiltAction {
+    bld: BuildContext,
+    tx: Tx,
+    outputs: Vec<Dictionary>,
+    action_evidence: Vec<ActionEvidence>,
+    st_tx_finalized: Statement,
+    finalization_evidence: txlib::FinalizationEvidence,
+}
+
+struct ActionResultClaimContext<'a> {
+    tx: &'a Tx,
+    inputs: &'a [Dictionary],
+    outputs: &'a [Dictionary],
+    action_evidence: &'a [ActionEvidence],
+    st_tx_finalized: &'a Statement,
+    finalization_evidence: &'a txlib::FinalizationEvidence,
 }
 
 impl ExeContext {
@@ -3221,7 +3483,7 @@ impl Executor {
         action: &str,
         inputs: Vec<SpendableObject>,
         args: &ActionArgs,
-    ) -> Result<(BuildContext, Tx, Vec<Dictionary>), SdkError> {
+    ) -> Result<BuiltAction, SdkError> {
         self.report_stage(ExecutionStage::Building);
         let meta = self
             .module
@@ -3258,7 +3520,7 @@ impl Executor {
         };
         let tx_inputs: Vec<Dictionary> = inputs.into_iter().map(|i| i.obj).collect();
         let mut tx_builder = self.new_tx_builder(&mut bld, &tx_inputs);
-        let outputs = match meta.kind {
+        let (outputs, action_evidence) = match meta.kind {
             ActionKind::Rekey => {
                 let class = &meta.total_inputs[0].class;
                 let scope = tx_builder.begin_action();
@@ -3275,7 +3537,7 @@ impl Executor {
                 )?;
                 tx_builder.set_guard(handle, guard);
                 tx_builder.end_action(scope);
-                vec![new]
+                (vec![new], Vec::new())
             }
             ActionKind::Script => {
                 let mut rhai_inputs = tx_inputs;
@@ -3289,6 +3551,7 @@ impl Executor {
                     tx_builder,
                     module: self.module.clone(),
                     outputs: Vec::new(),
+                    action_evidence: Vec::new(),
                     progress: self.progress.clone(),
                 }));
                 let action_handle = ActionHandle::new(action.to_string(), Some(exe_rc.clone()));
@@ -3301,15 +3564,695 @@ impl Executor {
                     .into_inner();
                 bld = context.bld;
                 tx_builder = context.tx_builder;
-                context.outputs
+                (context.outputs, context.action_evidence)
             }
         };
-        let (st_tx_finalize, tx, _stats) = tx_builder.finalize(&mut bld)?;
+        let (st_tx_finalize, tx, _stats, finalization_evidence) =
+            tx_builder.finalize_with_replay(&mut bld)?;
         bld.builder
             .reveal(&st_tx_finalize)
             .map_err(|err| anyhow!(err))?;
-        Ok((bld, tx, outputs))
+        Ok(BuiltAction {
+            bld,
+            tx,
+            outputs,
+            action_evidence,
+            st_tx_finalized: st_tx_finalize,
+            finalization_evidence,
+        })
     }
+
+    fn resolve_action_result_claim<'a>(
+        inputs: &'a [Dictionary],
+        outputs: &'a [Dictionary],
+        action_evidence: &'a [ActionEvidence],
+        request: &ActionResultClaimRequest,
+    ) -> Result<ResolvedActionResultClaim<'a>, SdkError> {
+        let result = outputs.get(request.output_index).ok_or_else(|| {
+            anyhow!(
+                "claim output index {} is out of range for {} outputs",
+                request.output_index,
+                outputs.len()
+            )
+        })?;
+        let input = request
+            .input_index
+            .map(|index| {
+                inputs.get(index).ok_or_else(|| {
+                    anyhow!(
+                        "claim input index {index} is out of range for {} inputs",
+                        inputs.len()
+                    )
+                })
+            })
+            .transpose()?;
+
+        let mut matches = action_evidence.iter().filter_map(|evidence| {
+            let output_slot = evidence
+                .outputs
+                .iter()
+                .position(|candidate| candidate.commitment() == result.commitment())?;
+            let input_slot = input.and_then(|input| {
+                evidence
+                    .inputs
+                    .iter()
+                    .position(|candidate| candidate.commitment() == input.commitment())
+            });
+            if input.is_some() && input_slot.is_none() {
+                return None;
+            }
+            Some((evidence, input_slot, output_slot))
+        });
+        let (evidence, input_slot, output_slot) = matches.next().ok_or_else(|| {
+            anyhow!("the requested result and input are not produced by one action statement")
+        })?;
+        if matches.next().is_some() {
+            return Err(
+                anyhow!("the requested commitments match more than one action statement").into(),
+            );
+        }
+
+        Ok(ResolvedActionResultClaim {
+            evidence,
+            input,
+            result,
+            input_slot,
+            output_slot,
+        })
+    }
+
+    fn claim_predicate_module(
+        params: &Params,
+        module: &SdkModule,
+        action: &str,
+        input_slot: Option<usize>,
+        result_slot: usize,
+        fields: &[String],
+    ) -> Result<(Arc<Module>, Vec<String>), SdkError> {
+        let action_hash = module
+            .action_hash(action)
+            .ok_or_else(|| anyhow!("missing action predicate hash"))?;
+        let tx_finalized = module
+            .txlib_mod
+            .predicate_ref_by_name("TxFinalized")
+            .ok_or_else(|| anyhow!("missing TxFinalized predicate"))?;
+
+        let mut primitive_premises = vec![
+            StatementTmplBuilder::new_from_pred(Predicate::Custom(
+                module
+                    .module
+                    .predicate_ref_by_name(action)
+                    .ok_or_else(|| anyhow!("missing action predicate"))?,
+            ))
+            .arg(("evidence", "action_io"))
+            .arg(("evidence", "state_header"))
+            .arg("chain0")
+            .arg("chain"),
+            StatementTmplBuilder::new_from_pred(NativePredicate::Equal)
+                .arg(("evidence", "io"))
+                .arg(("evidence", "action_io")),
+            StatementTmplBuilder::new_from_pred(Predicate::Custom(tx_finalized))
+                .arg(("evidence", "state_header"))
+                .arg(("claim", "tx_final_commitment"))
+                .arg(("evidence", "nullifiers"))
+                .arg(("evidence", "created")),
+            StatementTmplBuilder::new_from_pred(NativePredicate::Equal)
+                .arg(("claim", "action_predicate_hash"))
+                .arg(literal(action_hash)),
+            StatementTmplBuilder::new_from_pred(NativePredicate::Equal)
+                .arg(("evidence", "tx_final"))
+                .arg(("claim", "tx_final_commitment")),
+        ];
+        let replay = module
+            .txlib_mod
+            .predicate_ref_by_name("ReplayActions")
+            .unwrap();
+        let empty = pod2utils::set!();
+        let zero = pod2::middleware::EMPTY_VALUE;
+        let initial_scope = dict!({"created" => empty.clone(), "nullifiers" => empty.clone(), "chain_start" => zero, "chain_end" => zero});
+        let grounded = module
+            .txlib_mod
+            .predicate_ref_by_name("InputsGrounded")
+            .unwrap();
+        primitive_premises.extend([
+            StatementTmplBuilder::new_from_pred(Predicate::Custom(replay))
+                .arg(("evidence", "state_header"))
+                .arg(("evidence", "before_tx"))
+                .arg(("evidence", "after_tx"))
+                .arg("chain0")
+                .arg("chain"),
+            StatementTmplBuilder::new_from_pred(NativePredicate::Hash)
+                .arg(("evidence", "inputs"))
+                .arg(literal(zero))
+                .arg("chain0"),
+            StatementTmplBuilder::new_from_pred(NativePredicate::DictInsert)
+                .arg(literal(initial_scope))
+                .arg(literal("inputs"))
+                .arg(("evidence", "inputs"))
+                .arg(("evidence", "before_tx")),
+            StatementTmplBuilder::new_from_pred(NativePredicate::DictDelete)
+                .arg(("evidence", "after_tx"))
+                .arg(literal("inputs"))
+                .arg(("claim", "tx_final_commitment")),
+        ]);
+        primitive_premises.extend([
+            StatementTmplBuilder::new_from_pred(Predicate::Custom(grounded))
+                .arg(("evidence", "inputs"))
+                .arg(("evidence", "grounded_created")),
+            StatementTmplBuilder::new_from_pred(NativePredicate::ArrayContains)
+                .arg(("evidence", "state_header"))
+                .arg(literal(txlib::STATE_HEADER_CREATED_SLOT as i64))
+                .arg(("evidence", "grounded_created")),
+        ]);
+        if let Some(input_slot) = input_slot {
+            primitive_premises.push(
+                StatementTmplBuilder::new_from_pred(NativePredicate::Equal)
+                    .arg(("evidence", "input"))
+                    .arg(("claim", "input_commitment")),
+            );
+            primitive_premises.push(
+                StatementTmplBuilder::new_from_pred(NativePredicate::ArrayContains)
+                    .arg(("evidence", "io"))
+                    .arg(literal(input_slot as i64))
+                    .arg(("evidence", "input")),
+            );
+        }
+        primitive_premises.extend([
+            StatementTmplBuilder::new_from_pred(NativePredicate::Equal)
+                .arg(("evidence", "result"))
+                .arg(("claim", "output_commitment")),
+            StatementTmplBuilder::new_from_pred(NativePredicate::ArrayContains)
+                .arg(("evidence", "io"))
+                .arg(literal(result_slot as i64))
+                .arg(("evidence", "result")),
+            StatementTmplBuilder::new_from_pred(NativePredicate::SetContains)
+                .arg(("evidence", "created"))
+                .arg(("evidence", "result")),
+        ]);
+        for field in fields {
+            primitive_premises.push(
+                StatementTmplBuilder::new_from_pred(NativePredicate::DictContains)
+                    .arg(("evidence", "result"))
+                    .arg(literal(field.clone()))
+                    .arg(("disclosures", field.as_str())),
+            );
+        }
+
+        // Each private link carries the same five values, discharges at most
+        // five premises, and feeds its statement into the next link. The
+        // final wrapper keeps evidence and chain endpoints private while
+        // exposing only the generic claim metadata and disclosed fields.
+        let chain_args = ["claim", "disclosures", "evidence", "chain0", "chain"];
+        let mut builder =
+            CustomPredicateBatchBuilder::new(params.clone(), "action_result_claim".to_string());
+        let mut part_names = Vec::new();
+        let mut previous_predicate = None;
+        let mut offset = 0;
+        while offset < primitive_premises.len() {
+            let mut premises = Vec::new();
+            if let Some(predicate) = previous_predicate {
+                premises.push(chain_args.iter().fold(
+                    StatementTmplBuilder::new_from_pred(predicate),
+                    |statement, arg| statement.arg(*arg),
+                ));
+            }
+            let capacity = Params::max_custom_predicate_arity() - premises.len();
+            let end = (offset + capacity).min(primitive_premises.len());
+            premises.extend(primitive_premises[offset..end].iter().cloned());
+
+            let name = format!("ActionResultClaimPart{}", part_names.len());
+            previous_predicate = Some(
+                builder
+                    .predicate_and(&name, &chain_args, &[], &premises)
+                    .map_err(|err| anyhow!(err))?,
+            );
+            part_names.push(name);
+            offset = end;
+        }
+
+        let root_premise = chain_args.iter().fold(
+            StatementTmplBuilder::new_from_pred(
+                previous_predicate.ok_or_else(|| anyhow!("claim predicate has no premises"))?,
+            ),
+            |statement, arg| statement.arg(*arg),
+        );
+        builder
+            .predicate_and(
+                "ActionResultClaim",
+                &["claim", "disclosures"],
+                &["evidence", "chain0", "chain"],
+                &[root_premise],
+            )
+            .map_err(|err| anyhow!(err))?;
+        let batch = builder.finish().map_err(|err| anyhow!(err))?;
+        Ok((Arc::new(Module::new(batch, HashMap::new())), part_names))
+    }
+
+    fn add_action_result_disclosures(
+        &self,
+        bld: &mut BuildContext,
+        context: &ActionResultClaimContext<'_>,
+        resolved: &ResolvedActionResultClaim,
+        fields: &[String],
+    ) -> Result<(BTreeMap<String, Value>, Statement), SdkError> {
+        let tx = context.tx;
+        let inputs = context.inputs;
+        let st_tx_finalized = context.st_tx_finalized;
+        let finalization_evidence = context.finalization_evidence;
+        let mut disclosed_fields = BTreeMap::new();
+        for field in fields {
+            if disclosed_fields.contains_key(field) {
+                continue;
+            }
+            let value = resolved
+                .result
+                .get(&StrKey::from(field.as_str()))
+                .map_err(|err| anyhow!(err))?
+                .ok_or_else(|| anyhow!("result has no field {field:?}"))?;
+            disclosed_fields.insert(field.clone(), value);
+        }
+
+        let disclosures = Dictionary::new(
+            disclosed_fields
+                .iter()
+                .map(|(key, value)| (StrKey::from(key.as_str()), value.clone()))
+                .collect(),
+        );
+        let field_names = disclosed_fields.keys().cloned().collect::<Vec<_>>();
+        let action_hash = self
+            .module
+            .action_hash(&resolved.evidence.action)
+            .ok_or_else(|| anyhow!("missing action predicate hash"))?;
+        let mut claim_entries = HashMap::from([
+            (
+                StrKey::from("action_predicate_hash"),
+                Value::from(action_hash),
+            ),
+            (
+                StrKey::from("tx_final_commitment"),
+                Value::from(tx.dict().commitment()),
+            ),
+            (
+                StrKey::from("output_commitment"),
+                Value::from(resolved.result.commitment()),
+            ),
+        ]);
+        if let Some(input) = resolved.input {
+            claim_entries.insert(
+                StrKey::from("input_commitment"),
+                Value::from(input.commitment()),
+            );
+        }
+        let claim = Dictionary::new(claim_entries);
+        let action_io = match resolved.evidence.statement.args().first() {
+            Some(StatementArg::Literal(value)) => value.clone(),
+            _ => return Err(anyhow!("action IO argument is not a literal commitment").into()),
+        };
+        let replay_inputs = Set::new(inputs.iter().cloned().map(Value::from).collect());
+        let empty = pod2utils::set!();
+        let zero = pod2::middleware::EMPTY_VALUE;
+        let before_tx = dict!({"inputs" => replay_inputs.clone(), "created" => empty.clone(), "nullifiers" => empty, "chain_start" => zero, "chain_end" => zero});
+        let mut after_tx = tx.dict();
+        after_tx
+            .insert(&StrKey::from("inputs"), &Value::from(replay_inputs.clone()))
+            .map_err(|err| anyhow!(err))?;
+        let mut evidence_entries = HashMap::from([
+            (
+                StrKey::from("grounded_created"),
+                Value::from(tx.state_header.created_root),
+            ),
+            (StrKey::from("before_tx"), Value::from(before_tx.clone())),
+            (StrKey::from("after_tx"), Value::from(after_tx.clone())),
+            (StrKey::from("inputs"), Value::from(replay_inputs.clone())),
+            (StrKey::from("action_io"), action_io),
+            (
+                StrKey::from("io"),
+                Value::from(resolved.evidence.io.clone()),
+            ),
+            (
+                StrKey::from("state_header"),
+                Value::from(tx.state_header.array()),
+            ),
+            (StrKey::from("tx_final"), Value::from(tx.dict())),
+            (
+                StrKey::from("nullifiers"),
+                Value::from(tx.nullifiers.clone()),
+            ),
+            (StrKey::from("created"), Value::from(tx.created.clone())),
+            (StrKey::from("result"), Value::from(resolved.result.clone())),
+        ]);
+        if let Some(input) = resolved.input {
+            evidence_entries.insert(StrKey::from("input"), Value::from(input.clone()));
+        }
+        let evidence = Dictionary::new(evidence_entries);
+        let rebind = |builder: &mut MultiPodBuilder,
+                      replacements: Vec<Option<OperationArg>>,
+                      statement: Statement|
+         -> Result<Statement, SdkError> {
+            Ok(builder
+                .priv_op(Operation::replace_value_with_entry(replacements, statement))
+                .map_err(|err| anyhow!(err))?)
+        };
+
+        let evidence_action_io = entry(&evidence, "action_io").map_err(|err| anyhow!(err))?;
+        let evidence_io = entry(&evidence, "io").map_err(|err| anyhow!(err))?;
+        let evidence_state_header = entry(&evidence, "state_header").map_err(|err| anyhow!(err))?;
+        let evidence_tx_final = entry(&evidence, "tx_final").map_err(|err| anyhow!(err))?;
+        let evidence_nullifiers = entry(&evidence, "nullifiers").map_err(|err| anyhow!(err))?;
+        let evidence_created = entry(&evidence, "created").map_err(|err| anyhow!(err))?;
+        let evidence_result = entry(&evidence, "result").map_err(|err| anyhow!(err))?;
+        let claim_action_hash =
+            entry(&claim, "action_predicate_hash").map_err(|err| anyhow!(err))?;
+        let claim_tx_final = entry(&claim, "tx_final_commitment").map_err(|err| anyhow!(err))?;
+        let claim_result = entry(&claim, "output_commitment").map_err(|err| anyhow!(err))?;
+
+        let action_statement = rebind(
+            &mut bld.builder,
+            vec![
+                Some(evidence_action_io.clone()),
+                Some(evidence_state_header.clone()),
+                None,
+                None,
+            ],
+            resolved.evidence.statement.clone(),
+        )?;
+        let io_commitment_statement = bld
+            .builder
+            .priv_op(Operation::eq(
+                resolved.evidence.io.clone(),
+                resolved.evidence.io.commitment(),
+            ))
+            .map_err(|err| anyhow!(err))?;
+        let io_commitment_statement = rebind(
+            &mut bld.builder,
+            vec![Some(evidence_io.clone()), Some(evidence_action_io)],
+            io_commitment_statement,
+        )?;
+        let tx_finalized_statement = rebind(
+            &mut bld.builder,
+            vec![
+                Some(evidence_state_header),
+                Some(claim_tx_final.clone()),
+                Some(evidence_nullifiers),
+                Some(evidence_created.clone()),
+            ],
+            st_tx_finalized.clone(),
+        )?;
+        let action_hash_statement = bld
+            .builder
+            .priv_op(Operation::eq(action_hash, action_hash))
+            .map_err(|err| anyhow!(err))?;
+        let action_hash_statement = rebind(
+            &mut bld.builder,
+            vec![Some(claim_action_hash), None],
+            action_hash_statement,
+        )?;
+        let tx_final_statement = bld
+            .builder
+            .priv_op(Operation::eq(tx.dict(), tx.dict().commitment()))
+            .map_err(|err| anyhow!(err))?;
+        let tx_final_statement = rebind(
+            &mut bld.builder,
+            vec![Some(evidence_tx_final), Some(claim_tx_final)],
+            tx_final_statement,
+        )?;
+        let mut premises = vec![
+            action_statement,
+            io_commitment_statement,
+            tx_finalized_statement,
+            action_hash_statement,
+            tx_final_statement,
+        ];
+        let evidence_before = entry(&evidence, "before_tx").map_err(|err| anyhow!(err))?;
+        let evidence_after = entry(&evidence, "after_tx").map_err(|err| anyhow!(err))?;
+        let evidence_inputs = entry(&evidence, "inputs").map_err(|err| anyhow!(err))?;
+        premises.push(rebind(
+            &mut bld.builder,
+            vec![
+                Some(entry(&evidence, "state_header").map_err(|err| anyhow!(err))?),
+                Some(evidence_before.clone()),
+                Some(evidence_after.clone()),
+                None,
+                None,
+            ],
+            finalization_evidence.replay.clone(),
+        )?);
+        let seed = bld
+            .builder
+            .priv_op(Operation::hash(
+                replay_inputs.clone(),
+                pod2::middleware::EMPTY_VALUE,
+                resolved.evidence.chain0,
+            ))
+            .map_err(|err| anyhow!(err))?;
+        premises.push(rebind(
+            &mut bld.builder,
+            vec![Some(evidence_inputs.clone()), None, None],
+            seed,
+        )?);
+        let empty = pod2utils::set!();
+        let zero = pod2::middleware::EMPTY_VALUE;
+        let initial_scope = dict!({"created" => empty.clone(), "nullifiers" => empty, "chain_start" => zero, "chain_end" => zero});
+        let initial = bld
+            .builder
+            .priv_op(Operation::dict_insert(
+                initial_scope,
+                "inputs",
+                replay_inputs,
+                before_tx,
+            ))
+            .map_err(|err| anyhow!(err))?;
+        premises.push(rebind(
+            &mut bld.builder,
+            vec![None, None, Some(evidence_inputs), Some(evidence_before)],
+            initial,
+        )?);
+        let final_binding = bld
+            .builder
+            .priv_op(Operation::dict_delete(after_tx, "inputs", tx.dict()))
+            .map_err(|err| anyhow!(err))?;
+        premises.push(rebind(
+            &mut bld.builder,
+            vec![
+                Some(evidence_after),
+                None,
+                Some(entry(&claim, "tx_final_commitment").map_err(|err| anyhow!(err))?),
+            ],
+            final_binding,
+        )?);
+        let grounded_created = entry(&evidence, "grounded_created").map_err(|err| anyhow!(err))?;
+        premises.push(rebind(
+            &mut bld.builder,
+            vec![
+                Some(entry(&evidence, "inputs").map_err(|err| anyhow!(err))?),
+                Some(grounded_created.clone()),
+            ],
+            finalization_evidence.inputs_grounded.clone(),
+        )?);
+        let grounded_header = bld
+            .builder
+            .priv_op(Operation::array_contains(
+                tx.state_header.array(),
+                txlib::STATE_HEADER_CREATED_SLOT as i64,
+                tx.state_header.created_root,
+            ))
+            .map_err(|err| anyhow!(err))?;
+        premises.push(rebind(
+            &mut bld.builder,
+            vec![
+                Some(entry(&evidence, "state_header").map_err(|err| anyhow!(err))?),
+                None,
+                Some(grounded_created),
+            ],
+            grounded_header,
+        )?);
+        if let (Some(input), Some(input_slot)) = (resolved.input, resolved.input_slot) {
+            let evidence_input = entry(&evidence, "input").map_err(|err| anyhow!(err))?;
+            let claim_input = entry(&claim, "input_commitment").map_err(|err| anyhow!(err))?;
+            let input_statement = bld
+                .builder
+                .priv_op(Operation::eq(input.clone(), input.commitment()))
+                .map_err(|err| anyhow!(err))?;
+            premises.push(rebind(
+                &mut bld.builder,
+                vec![Some(evidence_input.clone()), Some(claim_input)],
+                input_statement,
+            )?);
+            let input_membership = bld
+                .builder
+                .priv_op(Operation::array_contains(
+                    resolved.evidence.io.clone(),
+                    input_slot as i64,
+                    input.clone(),
+                ))
+                .map_err(|err| anyhow!(err))?;
+            premises.push(rebind(
+                &mut bld.builder,
+                vec![Some(evidence_io.clone()), None, Some(evidence_input)],
+                input_membership,
+            )?);
+        }
+        let result_statement = bld
+            .builder
+            .priv_op(Operation::eq(
+                resolved.result.clone(),
+                resolved.result.commitment(),
+            ))
+            .map_err(|err| anyhow!(err))?;
+        premises.push(rebind(
+            &mut bld.builder,
+            vec![Some(evidence_result.clone()), Some(claim_result)],
+            result_statement,
+        )?);
+        let result_membership = bld
+            .builder
+            .priv_op(Operation::array_contains(
+                resolved.evidence.io.clone(),
+                (resolved.evidence.inputs.len() + resolved.output_slot) as i64,
+                resolved.result.clone(),
+            ))
+            .map_err(|err| anyhow!(err))?;
+        premises.push(rebind(
+            &mut bld.builder,
+            vec![Some(evidence_io), None, Some(evidence_result.clone())],
+            result_membership,
+        )?);
+        let created_membership = bld
+            .builder
+            .priv_op(Operation::set_contains(
+                tx.created.clone(),
+                resolved.result.clone(),
+            ))
+            .map_err(|err| anyhow!(err))?;
+        premises.push(rebind(
+            &mut bld.builder,
+            vec![
+                Some(evidence_created),
+                Some(evidence_result.clone()),
+                Some(evidence_result.clone()),
+            ],
+            created_membership,
+        )?);
+        for (field, value) in &disclosed_fields {
+            let disclosed_value =
+                entry(&disclosures, field.as_str()).map_err(|err| anyhow!(err))?;
+            let field_statement = bld
+                .builder
+                .priv_op(Operation::dict_contains(
+                    resolved.result.clone(),
+                    field.clone(),
+                    value.clone(),
+                ))
+                .map_err(|err| anyhow!(err))?;
+            premises.push(rebind(
+                &mut bld.builder,
+                vec![Some(evidence_result.clone()), None, Some(disclosed_value)],
+                field_statement,
+            )?);
+        }
+
+        let (claim_module, part_names) = Self::claim_predicate_module(
+            &self.params,
+            &self.module,
+            &resolved.evidence.action,
+            resolved.input_slot,
+            resolved.evidence.inputs.len() + resolved.output_slot,
+            &field_names,
+        )?;
+        bld.modules.push(claim_module);
+        let wildcard_values = map!({
+            "claim" => claim,
+            "disclosures" => disclosures,
+            "evidence" => evidence,
+            "chain0" => resolved.evidence.chain0,
+            "chain" => resolved.evidence.chain
+        });
+
+        let mut previous_statement = None;
+        let mut offset = 0;
+        for part_name in part_names {
+            let mut part_premises = Vec::new();
+            if let Some(statement) = previous_statement.take() {
+                part_premises.push(statement);
+            }
+            let capacity = Params::max_custom_predicate_arity() - part_premises.len();
+            let end = (offset + capacity).min(premises.len());
+            part_premises.extend(premises[offset..end].iter().cloned());
+            previous_statement = Some(
+                bld.apply_custom_pred(false, &part_name, wildcard_values.clone(), part_premises)
+                    .map_err(|err| anyhow!(err))?,
+            );
+            offset = end;
+        }
+        let root_premise = previous_statement
+            .ok_or_else(|| anyhow!("claim predicate produced no private statement"))?;
+        let claim_statement = bld
+            .apply_custom_pred(
+                true,
+                "ActionResultClaim",
+                wildcard_values,
+                vec![root_premise],
+            )
+            .map_err(|err| anyhow!(err))?;
+        Ok((disclosed_fields, claim_statement))
+    }
+
+    fn project_statement(
+        &self,
+        source: &MainPod,
+        statement: &Statement,
+    ) -> Result<MainPod, SdkError> {
+        let mut tx_builder = pod2::frontend::MainPodBuilder::new(&self.params, &self.vd_set);
+        tx_builder
+            .add_pod(source.clone())
+            .map_err(|err| anyhow!(err))?;
+        tx_builder
+            .open_input_st(true, 0, statement)
+            .map_err(|err| anyhow!(err))?;
+        let tx_pod = tx_builder
+            .prove(&*self.prover)
+            .map_err(|err| anyhow!(err))?;
+        Ok(tx_pod)
+    }
+
+    fn prove_transaction_with_result_claim(
+        &self,
+        mut bld: BuildContext,
+        context: ActionResultClaimContext<'_>,
+        request: &ActionResultClaimRequest,
+    ) -> Result<(MainPod, ActionResultClaim), SdkError> {
+        let resolved = Self::resolve_action_result_claim(
+            context.inputs,
+            context.outputs,
+            context.action_evidence,
+            request,
+        )?;
+        let (disclosed_fields, claim_statement) = self.add_action_result_disclosures(
+            &mut bld,
+            &context,
+            &resolved,
+            &request.disclose_fields,
+        )?;
+        let source = prove(bld.builder, &*self.prover, self.progress.as_ref())?;
+        let companion = self.project_statement(&source, &claim_statement)?;
+        let tx_pod = self.project_statement(&source, context.st_tx_finalized)?;
+
+        let claim = ActionResultClaim {
+            action: resolved.evidence.action.clone(),
+            action_predicate_hash: self
+                .module
+                .action_hash(&resolved.evidence.action)
+                .ok_or_else(|| anyhow!("missing action predicate hash"))?,
+            output_index: request.output_index,
+            input_index: request.input_index,
+            input_commitment: resolved.input.map(Dictionary::commitment),
+            output_commitment: resolved.result.commitment(),
+            disclosed_fields,
+            pod: companion,
+        };
+        Ok((tx_pod, claim))
+    }
+
     /// Execute an action that consumes some input objects and produces some output objects
     pub fn action(
         &self,
@@ -3325,11 +4268,71 @@ impl Executor {
         inputs: Vec<SpendableObject>,
         args: &ActionArgs,
     ) -> Result<SpendableObjects, SdkError> {
-        let (bld, tx, outputs) = self.build_action(action, inputs, args)?;
+        self.action_with_args_and_claim(action, inputs, args, None)
+    }
+
+    /// Execute an action and optionally produce a companion selective-
+    /// disclosure proof. The ordinary transaction pod still exposes only
+    /// `TxFinalized`; the richer proof is returned separately.
+    pub fn action_with_args_and_claim(
+        &self,
+        action: &str,
+        inputs: Vec<SpendableObject>,
+        args: &ActionArgs,
+        claim_request: Option<&ActionResultClaimRequest>,
+    ) -> Result<SpendableObjects, SdkError> {
+        if claim_request.is_some() {
+            let meta = self
+                .module
+                .actions
+                .iter()
+                .find(|meta| meta.name == action)
+                .ok_or_else(|| anyhow!("unknown action: {action}"))?;
+            if meta.kind == ActionKind::Rekey {
+                return Err(anyhow!(
+                    "action result claims are not supported for built-in rekey actions"
+                )
+                .into());
+            }
+            if meta.total_inputs.len() != meta.in_entries.len()
+                || meta.total_outputs.len() != meta.out_entries.len()
+            {
+                return Err(anyhow!(
+                    "action result claims are not supported for actions with nested object IO"
+                )
+                .into());
+            }
+        }
+        let all_inputs = inputs
+            .iter()
+            .map(|input| input.obj.clone())
+            .collect::<Vec<_>>();
+        let built = self.build_action(action, inputs, args)?;
+
+        let (tx_pod, claim) = if let Some(request) = claim_request {
+            let (tx_pod, claim) = self.prove_transaction_with_result_claim(
+                built.bld,
+                ActionResultClaimContext {
+                    tx: &built.tx,
+                    inputs: &all_inputs,
+                    outputs: &built.outputs,
+                    action_evidence: &built.action_evidence,
+                    st_tx_finalized: &built.st_tx_finalized,
+                    finalization_evidence: &built.finalization_evidence,
+                },
+                request,
+            )?;
+            (tx_pod, Some(claim))
+        } else {
+            (
+                prove(built.bld.builder, &*self.prover, self.progress.as_ref())?,
+                None,
+            )
+        };
+
         // Only TxFinalized is revealed, as required by the proof parser.
         log::info!("proving tx_pod for action {}", action);
         let start = std::time::Instant::now();
-        let tx_pod = prove(bld.builder, &*self.prover, self.progress.as_ref())?;
         tx_pod.pod.verify().unwrap();
         log::info!(
             "proving tx_pod for action {} took {:?}",
@@ -3337,12 +4340,18 @@ impl Executor {
             start.elapsed()
         );
 
-        let objs: Vec<SpendableObject> = outputs
+        let objs: Vec<SpendableObject> = built
+            .outputs
             .into_iter()
             .map(|obj| SpendableObject { obj })
             .collect();
 
-        Ok(SpendableObjects { tx_pod, objs, tx })
+        Ok(SpendableObjects {
+            tx_pod,
+            objs,
+            tx: built.tx,
+            claim,
+        })
     }
 
     /// Run the action body up to (and including) the multi-pod
@@ -3365,7 +4374,7 @@ impl Executor {
         inputs: Vec<SpendableObject>,
         args: &ActionArgs,
     ) -> Result<PlanData, SdkError> {
-        let (bld, _tx, _outputs) = self.build_action(action, inputs, args)?;
+        let BuiltAction { bld, .. } = self.build_action(action, inputs, args)?;
 
         // Snapshot the statements + operations before `solve` consumes
         // the builder. Operations let downstream consumers spot e.g.

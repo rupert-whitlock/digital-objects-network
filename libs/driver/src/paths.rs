@@ -46,6 +46,9 @@ pub const PAYLOAD_FILE: &str = "payload.bin";
 /// Record filename. Its presence marks a committed local transaction.
 pub const RECORD_FILE: &str = "record.json";
 
+/// Optional companion selective-disclosure proof for a transaction.
+pub const CLAIM_FILE: &str = "claim.json";
+
 /// File extension (no leading dot) of a digital-object file.
 pub const DOBJ_EXTENSION: &str = "dobj";
 

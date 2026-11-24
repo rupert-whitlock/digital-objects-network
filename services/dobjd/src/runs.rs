@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use driver::{ExecutionReporter, ExecutionStepContext, now_ms};
 use wire_types::transactions::{TransactionRecord, TransactionState};
 use wire_types::{
-    ActionInput, ExecutionPhase, ExecutionStage, ObjectStatus, ProofProgressStatus, QualifiedName,
-    RunAccepted, RunActionProgress, RunActionResult, RunStageTiming, RunState, RunStatus,
+    ActionInput, ActionResultClaimRequest, ExecutionPhase, ExecutionStage, ObjectStatus,
+    ProofProgressStatus, QualifiedName, RunAccepted, RunActionProgress, RunActionResult,
+    RunStageTiming, RunState, RunStatus,
 };
 
 use crate::events::{Event, EventHub};
@@ -346,6 +347,7 @@ impl RunReporter {
             old_root: record.grounding_root.clone(),
             output_files: record.output_files.clone(),
             input_files: record.input_files.clone(),
+            tx_final: record.tx_final.clone(),
         });
     }
 
@@ -383,6 +385,14 @@ impl ExecutionReporter for RunReporter {
 
 /// Start background execution and return a run handle.
 pub fn spawn_run(services: &Services, input: ActionInput) -> RunAccepted {
+    spawn_run_with_claim(services, input, None)
+}
+
+pub fn spawn_run_with_claim(
+    services: &Services,
+    input: ActionInput,
+    claim: Option<ActionResultClaimRequest>,
+) -> RunAccepted {
     let input = crate::proof_jobs::trimmed(input);
     let services_for_worker = services.clone();
     let driver = services.driver.clone();
@@ -393,9 +403,10 @@ pub fn spawn_run(services: &Services, input: ActionInput) -> RunAccepted {
         input.action,
         input.input_object_paths,
         move |reporter| {
-            let record = crate::proof_jobs::prove_and_record(
+            let record = crate::proof_jobs::prove_and_record_with_claim(
                 &services_for_worker,
                 exec_input,
+                claim,
                 reporter.run_id(),
                 reporter,
             )?;
@@ -672,6 +683,7 @@ mod tests {
             old_root: "0xold".to_string(),
             output_files: vec!["out.dobj".to_string()],
             input_files: vec!["in.dobj".to_string()],
+            tx_final: "0x01".to_string(),
         }
     }
 

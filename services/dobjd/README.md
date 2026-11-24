@@ -67,6 +67,7 @@ All routes return JSON unless noted; errors come back as
 | `POST` | `/transactions/submit`                  | `submit` each of `{ "txFinals": [...] }`, returns their records |
 | `GET`  | `/transactions`                 | `list_transactions`: open and recently completed records, oldest first      |
 | `GET`  | `/transactions/{tx_final}`      | `get_transaction`; `?wait=true&timeoutMs=` holds until landed or expired |
+| `GET`  | `/transactions/{tx_final}/claim` | return the optional companion action-result proof |
 | `DELETE` | `/transactions/{tx_final}`    | `delete_transaction`: abandon a recorded transaction never offered to the relayer |
 | `GET`  | `/events`                       | every state change (SSE), numbered by `seq`                  |
 
@@ -155,6 +156,24 @@ Each accepted `POST` mints a fresh `runId`; clients don't choose it. Terminal ru
 - `object-removed`: `{ fileName }`, an output of an expired or deleted transaction, or a discarded object.
 
 A client can keep its object list current from `object` and `object-removed` alone, re-listing only when its stream reconnects.
+
+### Optional action-result claims
+
+`POST /runs` accepts an optional `claim` alongside `input`, for example
+`{"outputIndex":0,"inputIndex":0,"discloseFields":["score"]}`. The SDK builds this
+companion proof during execution, when it still has the action statement and
+concrete objects. It publicly binds the action predicate, `tx_final`, the
+selected result, the optional input commitment, and the requested field
+values. The ordinary transaction proof and relayer payload are unchanged.
+
+On success, the run result includes `txFinal`; retrieve the companion proof
+with `GET /transactions/{tx_final}/claim`. The endpoint returns `404` when no
+claim was requested. Input/output indexes refer to the action's flattened
+object lists, and omitted `inputIndex` keeps the input commitment undisclosed.
+Claims for built-in rekey actions and actions with nested object IO are rejected
+before SDK proving. Verify retrieved envelopes using
+`sdk::SdkModule::verify_action_result_claim` with a trusted action hash and
+expected request. Proof validity does not establish network inclusion or finality.
 
 ## MCP integration
 

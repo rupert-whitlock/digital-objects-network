@@ -86,8 +86,10 @@ pub fn db_bytes_to_hash(bytes: &[u8]) -> Result<Hash> {
 
 pub fn log_init() {
     // Full date: `[year]-[month padding:zero]-[day padding:zero]`
-    let timer = time::format_description::parse("[hour]:[minute]:[second].[subsecond digits:2]")
-        .expect("valid format");
+    let timer = time::format_description::parse_borrowed::<1>(
+        "[hour]:[minute]:[second].[subsecond digits:2]",
+    )
+    .expect("valid format");
     let time_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
     let timer = OffsetTime::new(time_offset, timer);
     tracing_subscriber::registry()

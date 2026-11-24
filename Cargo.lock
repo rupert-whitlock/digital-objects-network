@@ -2326,6 +2326,7 @@ dependencies = [
  "futures-util",
  "log",
  "payload",
+ "pexe",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5493,6 +5494,7 @@ dependencies = [
  "toml",
  "txlib",
  "vdfpod",
+ "wire-types",
 ]
 
 [[package]]

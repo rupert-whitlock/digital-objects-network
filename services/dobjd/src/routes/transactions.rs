@@ -4,9 +4,9 @@ use axum::{
     extract::{Path, Query, State},
 };
 use wire_types::transactions::TransactionRecord;
-use wire_types::{SubmitTransactionsRequest, WaitQuery};
+use wire_types::{ActionResultClaim, SubmitTransactionsRequest, WaitQuery};
 
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::state::{AppState, parse_tx_final};
 
 /// `POST /transactions/submit`: submit records in order, stopping on the first error.
@@ -47,6 +47,21 @@ pub async fn get(
     Ok(Json(
         state.services.wait_for_transaction(&hash, query).await?,
     ))
+}
+
+/// `GET /transactions/{txFinal}/claim`: return the optional companion
+/// selective-disclosure proof generated with the action run.
+pub async fn get_claim(
+    State(state): State<AppState>,
+    Path(tx_final): Path<String>,
+) -> ApiResult<Json<ActionResultClaim>> {
+    let hash = parse_tx_final(&tx_final)?;
+    let driver = state.services.driver.clone();
+    let claim = tokio::task::spawn_blocking(move || driver.get_transaction_claim(&hash))
+        .await
+        .map_err(|err| anyhow!("claim read task panicked: {err}"))??
+        .ok_or_else(|| ApiError::new(axum::http::StatusCode::NOT_FOUND, "no claim requested"))?;
+    Ok(Json(claim))
 }
 
 /// `DELETE /transactions/{txFinal}`: remove the record and unknown outputs.

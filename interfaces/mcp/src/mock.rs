@@ -197,6 +197,7 @@ impl DobjOps for MockDobjOps {
                 old_root: "0xmockoldroot".to_string(),
                 output_files: vec!["craft-basics__wood_0xnew.dobj".to_string()],
                 input_files: vec![],
+                tx_final: MOCK_TX_FINAL.to_string(),
             }),
             error: None,
             progress: vec![],

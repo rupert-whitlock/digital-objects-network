@@ -332,6 +332,45 @@ pub struct ActionInput {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct StartRunRequest {
     pub input: ActionInput,
+    /// Optional companion proof about one produced object. Omitted requests
+    /// preserve the existing execution path exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ActionResultClaimRequest>,
+}
+
+/// Selective-disclosure request for one result of an action execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ActionResultClaimRequest {
+    pub output_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_index: Option<usize>,
+    #[serde(default)]
+    pub disclose_fields: Vec<String>,
+}
+
+/// Exported companion proof and its claimed public values.
+/// Verify with `sdk::SdkModule::verify_action_result_claim`, a trusted action
+/// hash, and the expected request. Names require trusted catalog resolution;
+/// indexes select that action's flattened IO (nested object IO is unsupported).
+/// Transaction proof validity does not establish network inclusion/finality.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ActionResultClaim {
+    pub action: QualifiedName,
+    pub action_predicate_hash: String,
+    /// DON transaction commitment, not an Ethereum transaction hash or finality indicator.
+    pub tx_final: String,
+    pub output_index: usize,
+    pub input_index: Option<usize>,
+    pub input_commitment: Option<String>,
+    pub output_commitment: String,
+    pub disclosed_fields: BTreeMap<String, serde_json::Value>,
+    /// POD2 `MainPod` JSON. Keeping this as JSON leaves wire-types free of
+    /// POD2 while preserving the standard proof serialization.
+    pub proof: serde_json::Value,
 }
 
 /// Result of a successful run.
@@ -348,6 +387,10 @@ pub struct RunActionResult {
     pub output_files: Vec<String>,
     /// The objects the transaction spends; nullified once it lands.
     pub input_files: Vec<String>,
+    /// Transaction commitment used to retrieve any companion claim through
+    /// `/transactions/{txFinal}/claim`.
+    #[serde(default)]
+    pub tx_final: String,
 }
 
 /// Lifecycle state of a run tracked in the daemon's run registry.

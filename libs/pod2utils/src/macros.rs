@@ -341,7 +341,7 @@ impl BuildContext {
                             wildcard_values.push((i, value.clone()));
                         }
                     }
-                    let st = self.builder.op(is_public, wildcard_values, op).unwrap();
+                    let st = self.builder.op(is_public, wildcard_values, op)?;
                     Ok(st)
                 });
             }

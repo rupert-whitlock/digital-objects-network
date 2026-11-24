@@ -1,6 +1,6 @@
 use anyhow::Result;
 use pod2::middleware::Hash;
-use sdk::{ActionArgs, SpendableObject, SpendableObjects};
+use sdk::{ActionArgs, ActionResultClaimRequest, SpendableObject, SpendableObjects};
 use txlib::GroundingWitness;
 
 use wire_types::{ActionSummary, QualifiedName};
@@ -43,6 +43,20 @@ pub trait ActionCatalog: Send + Sync {
         _progress: sdk::ExecutionProgress,
     ) -> Result<SpendableObjects> {
         self.execute_action(action, grounding_witness, inputs, args)
+    }
+    fn execute_action_with_claim(
+        &self,
+        action: QualifiedName,
+        grounding_witness: GroundingWitness,
+        inputs: Vec<SpendableObject>,
+        args: &ActionArgs,
+        claim: Option<&ActionResultClaimRequest>,
+        progress: sdk::ExecutionProgress,
+    ) -> Result<SpendableObjects> {
+        if claim.is_some() {
+            anyhow::bail!("this action catalog does not support companion claims");
+        }
+        self.execute_action_with_progress(action, grounding_witness, inputs, args, progress)
     }
     fn generated_podlang(&self) -> Option<String> {
         None

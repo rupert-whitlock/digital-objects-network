@@ -29,7 +29,7 @@ pub async fn start_run(
     State(state): State<AppState>,
     Json(req): Json<StartRunRequest>,
 ) -> (StatusCode, Json<RunAccepted>) {
-    let accepted = crate::runs::spawn_run(&state.services, req.input);
+    let accepted = crate::runs::spawn_run_with_claim(&state.services, req.input, req.claim);
     (StatusCode::ACCEPTED, Json(accepted))
 }
 

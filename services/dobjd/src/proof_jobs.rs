@@ -6,7 +6,10 @@ use std::time::Instant;
 
 use driver::{ExecuteActionInput, ExecutionReporter, ExecutionStepContext, now_ms};
 use wire_types::transactions::TransactionRecord;
-use wire_types::{ActionInput, ExecutionPhase, ExecutionStage, ProofJobState, ProofJobStatus};
+use wire_types::{
+    ActionInput, ActionResultClaimRequest, ExecutionPhase, ExecutionStage, ProofJobState,
+    ProofJobStatus,
+};
 
 use crate::events::Event;
 use crate::registry::{Registry, Retained};
@@ -227,6 +230,16 @@ pub(crate) fn prove_and_record<R: ExecutionReporter>(
     owner: &str,
     reporter: &R,
 ) -> anyhow::Result<TransactionRecord> {
+    prove_and_record_with_claim(services, input, None, owner, reporter)
+}
+
+pub(crate) fn prove_and_record_with_claim<R: ExecutionReporter>(
+    services: &Services,
+    input: ExecuteActionInput,
+    claim: Option<ActionResultClaimRequest>,
+    owner: &str,
+    reporter: &R,
+) -> anyhow::Result<TransactionRecord> {
     let reporter = HeldInputReporter {
         reporter: reporter.clone(),
         held: Arc::new(HeldInputs {
@@ -234,7 +247,9 @@ pub(crate) fn prove_and_record<R: ExecutionReporter>(
             files: Default::default(),
         }),
     };
-    let proved = services.driver.prove(input, owner, &reporter)?;
+    let proved = services
+        .driver
+        .prove_with_claim(input, claim, owner, &reporter)?;
     reporter.on_step(
         ExecutionPhase::Commit,
         ExecutionStage::WritingFiles.message(),

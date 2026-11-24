@@ -69,6 +69,10 @@ pub fn router(app_state: AppState, access: WebAccess) -> Router {
         .route("/transactions/submit", post(transactions::submit))
         .route("/transactions", get(transactions::list))
         .route(
+            "/transactions/{tx_final}/claim",
+            get(transactions::get_claim),
+        )
+        .route(
             "/transactions/{tx_final}",
             get(transactions::get).delete(transactions::delete),
         )
@@ -208,5 +212,65 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+    #[tokio::test]
+    async fn claim_enabled_http_execution_and_retrieval() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = DriverPaths::from_dobj_root(home.path());
+        std::fs::create_dir_all(&paths.actions_dir).unwrap();
+        let plugin = pexe::pack(
+            include_str!("../../../../examples/craft-basics/manifest.toml"),
+            include_str!("../../../../examples/craft-basics/plugin.rhai"),
+        )
+        .unwrap();
+        std::fs::write(paths.actions_dir.join("craft-basics.pexe"), plugin).unwrap();
+        let driver =
+            Arc::new(Driver::open(paths.clone(), DriverDeps::load_mock(&paths).unwrap()).unwrap());
+        let events = EventHub::new();
+        let services = Services {
+            settler: Arc::new(Settler::new(driver.clone(), events.clone())),
+            driver,
+            events,
+            runs: RunRegistry::default(),
+            proof_jobs: ProofJobRegistry::default(),
+        };
+        let mcp = Arc::new(McpRuntime::new(
+            services.clone(),
+            "127.0.0.1:7718".into(),
+            7717,
+        ));
+        let settle_worker = tokio::spawn(services.settler.clone().run_loop());
+        let app = router(AppState::new(services, mcp), WebAccess::new(7717));
+        let (status, run) = request(&app, "POST", "/runs", json!({
+            "input": {"action": {"pluginName": "craft-basics", "name": "FindLog"}, "inputObjectPaths": []},
+            "claim": {"outputIndex": 0, "discloseFields": ["type"]}
+        })).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let path = format!("/runs/{}", run["runId"].as_str().unwrap());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let (_, run) = request(&app, "GET", &path, Value::Null).await;
+                assert_ne!(run["status"], "failed", "{run}");
+                if run["status"] == "succeeded" {
+                    break run["result"].clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let path = format!(
+            "/transactions/{}/claim",
+            result["txFinal"].as_str().unwrap()
+        );
+        let (status, claim) = request(&app, "GET", &path, Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        let claim: wire_types::ActionResultClaim = serde_json::from_value(claim).unwrap();
+        assert_eq!(claim.action.name, "FindLog");
+        assert_eq!(claim.output_index, 0);
+        assert_eq!(claim.tx_final, result["txFinal"].as_str().unwrap());
+        assert_eq!(claim.disclosed_fields.len(), 1);
+        assert!(claim.disclosed_fields.contains_key("type"));
+        settle_worker.abort();
     }
 }

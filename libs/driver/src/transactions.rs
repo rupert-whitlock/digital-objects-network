@@ -9,9 +9,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use payload::{decode_hash_hex, encode_hash_hex};
 use pod2::middleware::Hash;
+use wire_types::ActionResultClaim;
 use wire_types::transactions::TransactionRecord;
 
-use crate::paths::{PAYLOAD_FILE, RECORD_FILE};
+use crate::paths::{CLAIM_FILE, PAYLOAD_FILE, RECORD_FILE};
 use crate::types::DriverPaths;
 
 pub(crate) fn transaction_dir(paths: &DriverPaths, tx_final: &Hash) -> PathBuf {
@@ -79,6 +80,34 @@ pub(crate) fn read_payload(paths: &DriverPaths, tx_final: &Hash) -> Result<Vec<u
     fs::read(&path).with_context(|| format!("failed to read {}", path.display()))
 }
 
+pub(crate) fn write_claim(
+    paths: &DriverPaths,
+    tx_final: &Hash,
+    claim: &ActionResultClaim,
+) -> Result<()> {
+    let dir = transaction_dir(paths, tx_final);
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(CLAIM_FILE);
+    let serialized =
+        serde_json::to_string_pretty(claim).context("failed to serialize companion claim")?;
+    fs::write(&path, serialized).with_context(|| format!("failed to write {}", path.display()))
+}
+
+pub(crate) fn read_claim(
+    paths: &DriverPaths,
+    tx_final: &Hash,
+) -> Result<Option<ActionResultClaim>> {
+    let path = transaction_dir(paths, tx_final).join(CLAIM_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))
+        .map(Some)
+}
+
 /// Replace the record atomically so readers see a complete file.
 pub(crate) fn write_record(paths: &DriverPaths, record: &TransactionRecord) -> Result<()> {
     let dir = transaction_dir(paths, &record_tx_final(record)?);
@@ -114,6 +143,7 @@ pub(crate) fn locked_inputs(records: &[TransactionRecord]) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
     use wire_types::QualifiedName;
 
@@ -155,5 +185,34 @@ mod tests {
         remove_transaction(&paths, &first).unwrap();
         assert!(load_records(&paths).unwrap().is_empty());
         remove_transaction(&paths, &first).unwrap();
+    }
+
+    #[test]
+    fn companion_claim_round_trips_separately_from_the_transaction_payload() {
+        let dir = tempdir().unwrap();
+        let paths = DriverPaths::from_dobj_root(dir.path());
+        let tx_final = Hash::from(pod2::middleware::RawValue::from(1));
+        let claim = ActionResultClaim {
+            action: QualifiedName::new("plugin", "Action"),
+            action_predicate_hash: encode_hash_hex(&Hash::from(pod2::middleware::RawValue::from(
+                2,
+            ))),
+            tx_final: encode_hash_hex(&tx_final),
+            output_index: 0,
+            input_index: None,
+            input_commitment: None,
+            output_commitment: encode_hash_hex(&Hash::from(pod2::middleware::RawValue::from(3))),
+            disclosed_fields: BTreeMap::new(),
+            proof: serde_json::json!({"proof": "serialized"}),
+        };
+
+        write_payload(&paths, &tx_final, b"transaction payload").unwrap();
+        write_claim(&paths, &tx_final, &claim).unwrap();
+
+        assert_eq!(
+            read_payload(&paths, &tx_final).unwrap(),
+            b"transaction payload"
+        );
+        assert_eq!(read_claim(&paths, &tx_final).unwrap(), Some(claim));
     }
 }

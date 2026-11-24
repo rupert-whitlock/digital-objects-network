@@ -248,6 +248,7 @@ pub async fn run(
                     input_object_paths: input_paths,
                     args,
                 },
+                claim: None,
             },
         )
         .await?;
